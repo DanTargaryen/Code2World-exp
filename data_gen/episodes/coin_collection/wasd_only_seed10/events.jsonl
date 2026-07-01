@@ -1,0 +1,15 @@
+{"t":0,"type":"coin_collected","coin_id":11,"x":0.3045666397549214,"y":-0.269307371601462}
+{"t":100,"type":"coin_collected","coin_id":3,"x":-4.406153018213809,"y":-6.1632929450832314}
+{"t":179,"type":"wall_hit"}
+{"t":180,"type":"wall_hit"}
+{"t":181,"type":"wall_hit"}
+{"t":182,"type":"wall_hit"}
+{"t":183,"type":"wall_hit"}
+{"t":184,"type":"wall_hit"}
+{"t":185,"type":"wall_hit"}
+{"t":186,"type":"wall_hit"}
+{"t":187,"type":"wall_hit"}
+{"t":188,"type":"wall_hit"}
+{"t":189,"type":"wall_hit"}
+{"t":190,"type":"wall_hit"}
+{"t":300,"type":"terminate","reason":"time_limit"}

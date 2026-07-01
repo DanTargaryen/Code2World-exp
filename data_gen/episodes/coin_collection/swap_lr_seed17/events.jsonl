@@ -1,0 +1,3 @@
+{"t":175,"type":"coin_collected","coin_id":7,"x":1.9330140491947532,"y":3.5353548627346747}
+{"t":296,"type":"coin_collected","coin_id":10,"x":0.8318191486410793,"y":1.6076165178790696}
+{"t":300,"type":"terminate","reason":"time_limit"}

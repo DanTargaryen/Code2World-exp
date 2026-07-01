@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Code2world — Causal DiT 训练计划</title>
+<link rel="stylesheet" href="/__assets/notebook.css">
+<link rel="stylesheet" href="/__assets/katex.min.css">
+</head>
+<body>
+<div class="page">
+  <div class="toolbar">
+    <button class="btn primary" id="save">保存到文件</button>
+    <button class="btn ghost sm" id="copy">复制 Markdown</button>
+    <span class="hint" id="hint">cell 双击编辑 · Shift+↵ 完成 · Ctrl+S 保存 · 拖 ⠿ 重排 · cell 间双击插入</span>
+  </div>
+  <div id="nb"></div>
+</div>
+
+<script id="seed" type="application/json">
+[
+  {"type":"html","html":"<h1 style='margin-bottom:4px'>Code-Conditioned Causal DiT — 训练计划</h1><p style='color:#888;margin-top:0'>Wan 2.1 VAE (冻结, 8× spatial, <b>latent 8×8×16</b>) + Causal DiT (分离式) + Qwen2.5-0.5B (冻结) · Teacher Forcing · MSE on latent</p>"},
+
+  {"type":"html","html":"<div style='border-left:3px solid #D97757;background:#FAF3EF;padding:14px 18px;border-radius:0 10px 10px 0'><b>一句话：</b>用 Wan <b>2.1</b> 的连续 VAE 把 64×64 帧压缩到 <b>8×8×16</b> latent（64 spatial positions × 16 channels），用 Qwen2.5-0.5B 编码 C++ 游戏源码，用从头训练的 Causal DiT 做 teacher forcing 的 next-frame latent regression。不需要 VQ codebook、不需要 diffusion 步骤、不需要 bidir→AR 转换。</div>"},
+
+  {"type":"html","html":"<h2>整体架构</h2>"},
+
+  {"type":"html","html":"<div style='background:#141413;color:#E8E6DE;padding:18px 22px;border-radius:12px;font-family:ui-monospace,monospace;font-size:12px;line-height:1.8'><pre style='margin:0'><span style='color:#888'>数据流:</span>\n\nProcgen 64×64 → <span style='color:#ffd23f'>Wan 2.1 VAE encode</span> (8×) → <span style='color:#46d3ff'>8×8×16 continuous latent</span>\n                                                                  ↓\n<span style='color:#788C5D'>Qwen2.5-0.5B</span> ← coinrun.cpp ──→ code tokens ──→ <span style='color:#788C5D'>cross-attention</span> ──┐\n                                                                   ↓\naction (15-dim) ──→ Linear → additive bias ──→ <span style='color:#D97757'>Causal DiT</span> ──→ predict next latent\n                                                   ↑                    ↓\n                                             block-causal          <span style='color:#ffd23f'>MSE loss</span>\n                                             self-attention     (+ reward/done CE)\n                                                                        ↓\n                                          <span style='color:#ffd23f'>Wan 2.1 VAE decode</span> ← predicted latent → 64×64 frame</pre></div>"},
+
+  {"type":"html","html":"<h2>三大组件</h2>"},
+
+  {"type":"html","html":"<div style='display:flex;gap:14px;flex-wrap:wrap'><div style='flex:1;min-width:250px;border:1.5px solid #ffd23f;border-radius:14px;background:#fff;padding:16px 20px'><h3 style='margin-top:0;color:#cba520'>① Wan 2.1 VAE (冻结)</h3><ul style='line-height:1.8;padding-left:18px'><li>Wan <b>2.1</b> 预训练 3D Causal VAE（A14B 版本）</li><li>空间压缩 <b>8×</b>：64×64 → <b>8×8</b></li><li>latent = <b>8×8×16</b>（64 positions × <b>16 channels</b>）</li><li>连续 latent（非 VQ 离散）</li><li>冻结权重，只做 encode/decode</li><li>✅ 实测 PSNR <b>29.5dB</b>，重建质量优秀</li></ul></div><div style='flex:1;min-width:250px;border:1.5px solid #788C5D;border-radius:14px;background:#fff;padding:16px 20px'><h3 style='margin-top:0;color:#788C5D'>② Qwen2.5-0.5B Code Encoder (冻结)</h3><ul style='line-height:1.8;padding-left:18px'><li>纯文本模型（不是 VL）</li><li>冻结，取最后一层 hidden states</li><li>输入：<b><code>coinrun.cpp</code> 完整 C++ 源码</b>（524行，~2-3K tokens）</li><li>输出：code_tokens (N, 896)</li><li><code>Linear(896, 512)</code> 投影到 DiT 维度</li><li>源码即规则：包含 gravity、maxspeed、碰撞逻辑、动作映射…</li><li>反事实时直接改源码数值重新编码</li></ul></div><div style='flex:1;min-width:250px;border:1.5px solid #D97757;border-radius:14px;background:#fff;padding:16px 20px'><h3 style='margin-top:0;color:#D97757'>③ Causal DiT (从头训练)</h3><ul style='line-height:1.8;padding-left:18px'><li>12 层分离式 DiT Block</li><li>embed_dim=512, 8 heads</li><li>block-causal attention</li><li>action: per-layer additive bias</li><li>code: cross-attention</li><li>~80-100M 参数</li></ul></div></div>"},
+
+  {"type":"html","html":"<h2>DiT Block 结构（分离式）</h2><p>每层包含 4 个子模块，按顺序执行：</p>"},
+
+  {"type":"html","html":"<div style='background:#141413;color:#E8E6DE;padding:16px 20px;border-radius:12px;font-family:ui-monospace,monospace;font-size:12px;line-height:1.8'><pre style='margin:0'>┌─────────────────────────────────────────────────────────────┐\n│ <span style='color:#D97757'>DiT Block ℓ</span>  (共 12 层，每层结构相同)                       │\n│                                                             │\n│  <span style='color:#ffd23f'>x += action_bias_ℓ(action_onehot)</span>                        │\n│  │    └─ Linear(15, 512, bias=False)                       │\n│  │    └─ broadcast: (B,T,512) → (B,T,64,512) 到帧内全部位置 │\n│  ↓                                                          │\n│  <span style='color:#46d3ff'>x += SpatialSelfAttn(LN(x))</span>                               │\n│  │    └─ 帧内 64 spatial tokens full attention              │\n│  │    └─ 学习空间结构（物体位置、平台形状）                   │\n│  ↓                                                          │\n│  <span style='color:#46d3ff'>x += TemporalCausalAttn(LN(x))</span>                            │\n│  │    └─ 同 spatial 位置跨帧 causal attend                  │\n│  │    └─ frame t 只看 frame 0..t-1（AR 核心）                │\n│  ↓                                                          │\n│  <span style='color:#788C5D'>x += CrossAttn(LN(x), code_tokens)</span>                        │\n│  │    └─ Q=visual tokens, K/V=code tokens                  │\n│  │    └─ 注入规则条件（~0.7% 能量，方向性足够）              │\n│  ↓                                                          │\n│  <span style='color:#E8E6DE'>x += FFN(LN(x))</span>                                           │\n│       └─ Linear(512, 2048) → GELU → Linear(2048, 512)     │\n└─────────────────────────────────────────────────────────────┘</pre></div>"},
+
+  {"type":"html","html":"<div style='border-left:3px solid #788C5D;background:#F4F6EF;padding:12px 16px;border-radius:0 10px 10px 0;margin-top:12px'><b>为什么分离式：</b>Spatial + Temporal 分开让模型分别学空间结构和时间动态（Wan 本身就是这种设计）。后续如果想用 Wan 预训练的 self-attention 权重 warm start，模块可以直接对上。</div>"},
+
+  {"type":"html","html":"<h2>注意力模式</h2>"},
+
+  {"type":"html","html":"<div style='display:flex;gap:14px;flex-wrap:wrap'><div style='flex:1;min-width:250px;border:1.5px solid #D1CFC5;border-radius:12px;background:#fff;padding:14px 18px'><h3 style='margin-top:0'>Spatial Self-Attention</h3><p>帧<b>内</b>：同一帧的 16 个 spatial token 互相 full attend</p><div style='background:#141413;color:#E8E6DE;padding:10px 14px;border-radius:8px;font-family:ui-monospace,monospace;font-size:11px'>f0: [s0 s1 ... s15] ← full attn<br>f1: [s0 s1 ... s15] ← full attn<br>各帧独立，不跨帧</div></div><div style='flex:1;min-width:250px;border:1.5px solid #D1CFC5;border-radius:12px;background:#fff;padding:14px 18px'><h3 style='margin-top:0'>Temporal Causal Attention</h3><p>帧<b>间</b>：同一 spatial 位置跨帧 causal attend</p><div style='background:#141413;color:#E8E6DE;padding:10px 14px;border-radius:8px;font-family:ui-monospace,monospace;font-size:11px'>position s0: f0.s0 ← f0.s0<br>position s0: f1.s0 ← f0.s0, f1.s0<br>position s0: f2.s0 ← f0.s0, f1.s0, f2.s0<br><span style='color:#788C5D'>frame t 只看 0..t，不看 t+1..T</span></div></div></div>"},
+
+  {"type":"html","html":"<h2>损失函数</h2><div style='background:#141413;color:#E8E6DE;padding:14px 18px;border-radius:10px;font-family:ui-monospace,monospace;font-size:13px;line-height:1.7'>L = <span style='color:#ffd23f'>L_latent</span> + λ₁·<span style='color:#46d3ff'>L_reward</span> + λ₂·<span style='color:#788C5D'>L_done</span></div>"},
+
+  {"type":"table","head":["损失项","方法","说明"],"rows":[["L_latent (主)","MSE(predicted_latent, GT_latent)","8×8 latent 空间仍然低维。如后续发现多模态分布问题，可升级为 1-step flow matching"],["L_reward","CrossEntropy (3 类: -1/0/+1)","辅助监督"],["L_done","CrossEntropy (2 类)","辅助监督"]]},
+
+  {"type":"html","html":"<h2>模型规格</h2>"},
+
+  {"type":"table","head":["参数","值","说明"],"rows":[["embed_dim","512","通过 Linear(16, 512) 从 latent 投影"],["num_layers","12","中等深度"],["num_heads","8","head_dim = 64"],["spatial_tokens/帧","64 (8×8)","Wan 2.1 VAE 8× 压缩，64×64 → 8×8"],["latent_channels","16","Wan VAE 固定 16 通道"],["input_proj","Linear(16, 512)","latent 16ch → embed_dim"],["output_proj","Linear(512, 16)","embed_dim → latent 16ch (预测头)"],["temporal_frames","16","上下文窗口（64 spatial × 16 temporal = 1024 tokens）"],["序列长度","1024","spatial 64 × temporal 16"],["code_tokens","可变","Qwen2.5 输出序列长度"],["action_dim","15","Procgen Discrete(15)"],["总参数量","~80-100M","适配 8×A800 DDP"],["batch_size","64 × N_GPU",""],["optimizer","AdamW, lr=1e-4, wd=0.01","cosine decay, warmup 1K"],["训练步数","~100K",""],["预计耗时","4-8h (4×GPU)",""]]},
+
+  {"type":"html","html":"<h2>三路输入对齐（全部投影到 512 维）</h2><p>三路输入原始维度不同，各自通过可训练的 Linear 投影到 DiT 的 embed_dim=512，在<b>同一 embedding space</b> 里交互：</p>"},
+
+  {"type":"html","html":"<div style='background:#141413;color:#E8E6DE;padding:14px 18px;border-radius:10px;font-family:ui-monospace,monospace;font-size:12px;line-height:1.7'><pre style='margin:0'><span style='color:#ffd23f'>VAE latent</span>  (8×8×<span style='color:#46d3ff'>16</span>)    → Linear(<span style='color:#46d3ff'>16</span>, <span style='color:#ffd23f'>512</span>)  → 512-dim spatial tokens → self-attention 输入\n<span style='color:#D97757'>Action</span>      (15-dim onehot) → Linear(<span style='color:#46d3ff'>15</span>, <span style='color:#ffd23f'>512</span>)  → 512-dim bias          → additive bias 加到 tokens\n<span style='color:#788C5D'>Code (C++)</span>  (N, <span style='color:#46d3ff'>896</span>)       → Linear(<span style='color:#46d3ff'>896</span>, <span style='color:#ffd23f'>512</span>) → 512-dim code tokens   → cross-attention K/V\n\n<span style='color:#888'>输出: DiT output (512) → Linear(512, 16) → 还原 VAE latent 空间 16ch</span></pre></div>"},
+
+  {"type":"table","head":["输入","原始维度","投影","512-dim","注入方式"],"rows":[["VAE latent","16 channels","Linear(16, 512) 可训练","spatial tokens","self-attention 输入"],["Action","15 (one-hot)","Linear(15, 512) 每层独立，可训练","additive bias","加到 token 上"],["Code (C++ 源码)","896 (Qwen2.5 hidden)","Linear(896, 512) 可训练","code tokens","cross-attention K/V"]]},
+
+  {"type":"html","html":"<div style='border-left:3px solid #788C5D;background:#F4F6EF;padding:12px 16px;border-radius:0 10px 10px 0'><b>关键细节：</b><ul style='margin:4px 0 0 0;padding-left:18px;line-height:1.8'><li>VAE 和 Qwen 本身<b>冻结</b>，只有三个 projection 层参与训练</li><li>Action 的 Linear <b>每个 DiT layer 独立一个</b>（共 12 个），让不同层从 action 中提取不同层次的信息</li><li>Code 的 projection 全局共享一个（规则文本不随层变化）</li><li>输出时对称投影：<code>Linear(512, 16)</code> 把 DiT output 映射回 VAE latent 的 16 channels</li></ul></div>"},
+
+  {"type":"html","html":"<h2>Code Condition — 直接喂 C++ 源码</h2><p>训练时将 <code>procgen/src/games/coinrun.cpp</code> 完整 524 行 C++ 源码喂给 Qwen2.5-0.5B 编码。<b>不再需要人工撰写 rules.json</b>——源码本身就是 rules.json 的超集。</p>"},
+
+  {"type":"table","head":["rules.json 想描述的","coinrun.cpp 直接包含的","行号"],"rows":[["gravity: standard","gravity = 0.2f;","419"],["jump: parabolic arc","max_jump = 1.5;","420"],["movement speed","maxspeed = .5;","422"],["air control","air_control = 0.15f;","421"],["goal reward","GOAL_REWARD = 10.0f","12"],["enemy patrol","ent->vx = .15 * (rand_gen.randn(2)*2-1)","253"],["die on enemy","if (obj->type == ENEMY) { step_data.done = true; }","126-128"],["action mapping","action_vx = move_action / 3 - 1","452"],["完整速度更新逻辑","update_agent_velocity() 函数","156-173"]]},
+
+  {"type":"html","html":"<div style='border-left:3px solid #788C5D;background:#F4F6EF;padding:12px 16px;border-radius:0 10px 10px 0'>源码比 JSON <b>信息量大得多</b>——JSON 只能写 \"gravity: standard\"，源码直接告诉模型 <code>gravity = 0.2f</code>、速度怎么积分（<code>agent->vy -= gravity</code>）、跳跃怎么触发、空中控制比地面弱多少。这才是博客说的「code grounds rules」。</div>"},
+
+  {"type":"html","html":"<h2>Code Sensitivity 反事实验证</h2><p>训练后改规则描述，测试模型是否真的用了 code condition：</p>"},
+
+  {"type":"table","head":["扰动","改源码哪里","期望"],"rows":[["改动作语义","action_vx = move_action/3-1 → 1-move_action/3 (L452)","同一 action 移动方向反转"],["改物理","gravity = 0.2f → 0.5f (L419)","下落更快，跳跃弧线变低"],["改奖励","GOAL_REWARD = 10.0f → 1.0f (L12)","验证模型是否读了此值"],["改碰撞","注释掉 enemy collision → done (L126-128)","碰敌人不再死亡"],["空白 code","zero out cross-attention output","预测退化，证明 code 有信息增益"]]},
+
+  {"type":"html","html":"<div style='border-left:3px solid #D97757;background:#FAF3EF;padding:12px 16px;border-radius:0 10px 10px 0'>博客的最小成功标准：<b>改代码后模型预测跟着变</b>。如果模型只记住视频分布而忽略 code condition，它会在反事实测试中失败。这正是 Code2world 项目要验证的核心命题。</div>"},
+
+  {"type":"html","html":"<h2>文件结构</h2><div style='background:#141413;color:#E8E6DE;padding:14px 18px;border-radius:10px;font-family:ui-monospace,monospace;font-size:12px;line-height:1.7'><pre style='margin:0'>workspace/Code2world/model/\n├── configs/\n│   └── coinrun_64.yaml           <span style='color:#788C5D'># 训练超参</span>\n├── data/\n│   ├── collect.py                <span style='color:#788C5D'># Procgen 采集 (随机策略, 64×64)</span>\n│   └── dataset.py                <span style='color:#788C5D'># PyTorch Dataset (episodes → sequences)</span>\n├── models/\n│   ├── vae.py                    <span style='color:#ffd23f'># Wan 2.1 VAE wrapper (冻结, 8× spatial, 16ch)</span>\n│   ├── text_encoder.py           <span style='color:#788C5D'># Qwen2.5-0.5B wrapper (编码 C++ 源码)</span>\n│   ├── causal_dit.py             <span style='color:#D97757'># Causal DiT (spatial+temporal+cross)</span>\n│   ├── action_module.py          <span style='color:#D97757'># Action additive bias</span>\n│   └── world_model.py            <span style='color:#D97757'># 总装: VAE + DiT + TextEnc + Action</span>\n├── train.py                      <span style='color:#D97757'># 训练脚本 (DDP, teacher forcing)</span>\n├── evaluate.py                   <span style='color:#D97757'># 评估脚本</span>\n├── rules/\n│   └── coinrun.cpp               <span style='color:#788C5D'># 从 procgen/src/games/ 拷贝（反事实时改此文件）</span>\n└── README.md</pre></div>"},
+
+  {"type":"html","html":"<h2>实施时间线</h2>"},
+
+  {"type":"table","head":["阶段","内容","耗时","依赖"],"rows":[["Step 1","采集 Procgen CoinRun ~1M transitions (64×64)","30s ✅ 已完成","procgen"],["Step 2","验证 Wan 2.1 VAE 重建质量 (8×8×16 latent)","✅ 已完成 PSNR 29.5dB","Wan 2.1 权重"],["Step 3","采集 code 变体数据（多游戏 + 参数变体源码）","1h","procgen 源码可编译 ✅"],["Step 4","训练 Causal DiT (DDP, teacher forcing)","4-8h (4×GPU)","Step 1-3"],["Step 5","评估 (action following + rollout + code sensitivity)","1h","Step 4"],["总计","","~1-2 天",""]]},
+
+  {"type":"html","html":"<h2>核心参考</h2><div style='display:flex;flex-direction:column;gap:8px'><div style='border:1.5px solid #D1CFC5;border-radius:10px;background:#fff;padding:12px 16px;display:flex;gap:12px;align-items:center'><div style='background:#D97757;color:#fff;padding:4px 10px;border-radius:6px;font-size:12px;font-weight:600;white-space:nowrap'>DiT 结构</div><div><b>Wan 2.1</b> — 3D Causal VAE (<b>8× spatial, 16ch latent</b>) + 分离式 DiT。用 2.1 的 VAE（非 2.2）：2.2 空间压缩 16×/32×，64×64 帧只剩 4×4 或 2×2，信息损失大。</div></div><div style='border:1.5px solid #D1CFC5;border-radius:10px;background:#fff;padding:12px 16px;display:flex;gap:12px;align-items:center'><div style='background:#788C5D;color:#fff;padding:4px 10px;border-radius:6px;font-size:12px;font-weight:600;white-space:nowrap'>Action + Code</div><div><b>ReactiveGWM</b> (arxiv 2605.15256) — action additive bias + cross-attn NPC prompt。直接复用注入机制。</div></div><div style='border:1.5px solid #D1CFC5;border-radius:10px;background:#fff;padding:12px 16px;display:flex;gap:12px;align-items:center'><div style='background:#46d3ff;color:#141413;padding:4px 10px;border-radius:6px;font-size:12px;font-weight:600;white-space:nowrap'>World Model</div><div><b>IRIS</b> (github eloialonso/iris) — VQ-VAE + AR Transformer, ~850 行。参考 loss 设计和 episode dataset 格式。</div></div></div>"},
+
+  {"type":"html","html":"<div style='border:1.5px solid #D97757;border-radius:14px;background:#fff;padding:16px 20px;margin-top:16px'><h3 style='margin-top:0'>Wan VAE 版本对比 & 备选方案</h3>"},
+
+  {"type":"table","head":["Wan VAE 版本","空间压缩","64×64 帧 → latent","可用性"],"rows":[["Wan 2.1 (A14B) ✅","8×","8×8×16 = 64 positions","✅ 适合 (PSNR 29.5dB)"],["Wan 2.2 base","16×","4×4×16 = 16 positions","⚠️ 信息损失较大"],["Wan 2.2 + patchify","32×","2×2×16 = 4 positions","❌ 太小"]]},
+
+  {"type":"html","html":"<p>✅ Wan 2.1 VAE 实测 PSNR 29.5dB，重建质量优秀，直接冻结使用，无需自训 VQ-VAE。备选：若某些游戏重建差可退回小 VQ-VAE（Encoder 3 层 Conv2d → 8×8，Codebook 512，单卡 1-2h）。</p></div>"}
+]
+</script>
+
+<script src="/__assets/katex.min.js"></script>
+<script src="/__assets/notebook.js"></script>
+<script>HtmlVibeNotebook.mount(JSON.parse(document.getElementById('seed').textContent));</script>
+</body>
+</html>

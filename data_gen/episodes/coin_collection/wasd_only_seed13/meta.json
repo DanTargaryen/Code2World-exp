@@ -1,0 +1,154 @@
+{
+  "game": "coin_collection",
+  "seed": 13,
+  "params": {
+    "dirs": [
+      [
+        0,
+        0
+      ],
+      [
+        0,
+        1
+      ],
+      [
+        0,
+        -1
+      ],
+      [
+        -1,
+        0
+      ],
+      [
+        1,
+        0
+      ]
+    ],
+    "action_names": [
+      "noop",
+      "up",
+      "down",
+      "left",
+      "right"
+    ],
+    "key_binding": {
+      "noop": [],
+      "up": [
+        "KeyW",
+        "ArrowUp"
+      ],
+      "down": [
+        "KeyS",
+        "ArrowDown"
+      ],
+      "left": [
+        "KeyA",
+        "ArrowLeft"
+      ],
+      "right": [
+        "KeyD",
+        "ArrowRight"
+      ]
+    }
+  },
+  "effective_params": {
+    "arena": 8,
+    "player_speed": 0.18,
+    "player_radius": 0.35,
+    "coin_count": 12,
+    "coin_radius": 0.3,
+    "coin_reward": 1,
+    "step_penalty": 0,
+    "time_limit": 300,
+    "dt": 1,
+    "dirs": [
+      [
+        0,
+        0
+      ],
+      [
+        0,
+        1
+      ],
+      [
+        0,
+        -1
+      ],
+      [
+        -1,
+        0
+      ],
+      [
+        1,
+        0
+      ]
+    ],
+    "action_names": [
+      "noop",
+      "up",
+      "down",
+      "left",
+      "right"
+    ],
+    "key_binding": {
+      "noop": [],
+      "up": [
+        "KeyW",
+        "ArrowUp"
+      ],
+      "down": [
+        "KeyS",
+        "ArrowDown"
+      ],
+      "left": [
+        "KeyA",
+        "ArrowLeft"
+      ],
+      "right": [
+        "KeyD",
+        "ArrowRight"
+      ]
+    }
+  },
+  "action_schema": {
+    "type": "discrete",
+    "n": 5,
+    "actions": [
+      "noop",
+      "up",
+      "down",
+      "left",
+      "right"
+    ],
+    "key_binding": {
+      "noop": [],
+      "up": [
+        "KeyW",
+        "ArrowUp"
+      ],
+      "down": [
+        "KeyS",
+        "ArrowDown"
+      ],
+      "left": [
+        "KeyA",
+        "ArrowLeft"
+      ],
+      "right": [
+        "KeyD",
+        "ArrowRight"
+      ]
+    },
+    "semantics": "action_id sets player velocity direction; magnitude = player_speed per step"
+  },
+  "resolution": [
+    256,
+    256
+  ],
+  "requested_steps": 300,
+  "actual_steps": 300,
+  "done": true,
+  "terminate_reason": "time_limit",
+  "final_score": 3,
+  "frame_count": 301
+}

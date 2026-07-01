@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Code2world — 训练 Pipeline 详解</title>
+<link rel="stylesheet" href="/__assets/notebook.css">
+<link rel="stylesheet" href="/__assets/katex.min.css">
+</head>
+<body>
+<div class="page">
+  <div class="toolbar">
+    <button class="btn primary" id="save">保存到文件</button>
+    <button class="btn ghost sm" id="copy">复制 Markdown</button>
+    <span class="hint" id="hint">cell 双击编辑 · Shift+↵ 完成 · Ctrl+S 保存 · 拖 ⠿ 重排 · cell 间双击插入</span>
+  </div>
+  <div id="nb"></div>
+</div>
+
+<script id="seed" type="application/json">
+[
+  {"type":"html","html":"<h1 style='margin-bottom:4px'>Code2world — 训练 Pipeline 详解</h1><p style='color:#888;margin-top:0'>Teacher Forcing · MSE Latent + 辅助 Reward/Done · 单卡 AMP(bf16) · 63.6M 全可训练参数</p>"},
+
+  {"type":"html","html":"<h2>整体流程</h2><div style='background:#141413;color:#E8E6DE;padding:16px 20px;border-radius:12px;font-family:ui-monospace,monospace;font-size:12px;line-height:1.8'><pre style='margin:0'><span style='color:#888'>每个训练 step:</span>\n\n  DataLoader 吐一个 batch (B=8 个窗口, 各来自随机变体/episode/位置)\n    ↓\n  拆成 inp_lat(帧0~31) / tgt_lat(帧1~32) / action / code\n    ↓\n  DiT forward (<span style='color:#ffd23f'>teacher forcing</span>: 输入全用 GT latent)\n    ↓\n  算 loss: <span style='color:#D97757'>MSE(pred, tgt)</span> + 0.1×<span style='color:#46d3ff'>CE(reward)</span> + 0.1×<span style='color:#788C5D'>CE(done)</span>\n    ↓\n  AMP(bf16) backward → grad_clip(1.0) → AdamW step</pre></div>"},
+
+  {"type":"html","html":"<h2>Step ① — DataLoader 吐 batch</h2><p>从 16,855 个训练窗口（7 变体 × 2600 episodes）里随机抽 B=8 个。每个样本从某个变体的某条 episode 里截连续 33 帧：</p>"},
+
+  {"type":"table","head":["字段","shape","dtype","含义"],"rows":[["latents","(8, 33, 16, 8, 8)","float32","T+1 帧的 VAE latent (Wan 2.1 预编码, fp16→fp32)"],["actions","(8, 32)","int64","T 步动作 id (0~8)"],["rewards","(8, 32)","float32","每步原始奖励 (CoinRun: 0 或 10)"],["dones","(8, 32)","int64","每步是否终止 (0/1)"],["code","(8, ~4600, 896)","float32","该样本变体的 coinrun.cpp Qwen embedding (冻结)"],["code_mask","(8, ~4600)","bool","padding mask (变体 token 数不同, True=有效)"]]},
+
+  {"type":"html","html":"<h2>Step ② — 拆输入和目标</h2><div style='background:#141413;color:#E8E6DE;padding:14px 18px;border-radius:10px;font-family:ui-monospace,monospace;font-size:12px;line-height:1.7'><pre style='margin:0'><span style='color:#ffd23f'>inp_lat</span> = latents[:, :32]     <span style='color:#788C5D'>← 帧 0~31 的 latent (喂给模型)</span>\n<span style='color:#D97757'>tgt_lat</span> = latents[:, 1:33]    <span style='color:#788C5D'>← 帧 1~32 的 latent (GT 目标 = 下一帧)</span>\n\naction → F.one_hot(_, 9)    → (8, 32, 9) float   <span style='color:#788C5D'>← additive bias 输入</span>\nreward → sign()+1           → (8, 32) {0,1,2}     <span style='color:#788C5D'>← 3 类分类标签</span>\ndone   → .long()             → (8, 32) {0,1}       <span style='color:#788C5D'>← 2 类分类标签</span>\ncode   → 原样传入 cross-attention</pre></div><p style='color:#888;margin-top:8px'>对齐约定: position t 的输入是 frame t 的 latent, 目标是 frame t+1 的 latent.</p>"},
+
+  {"type":"html","html":"<h2>Step ③ — DiT Forward (Teacher Forcing)</h2>"},
+
+  {"type":"html","html":"<div style='background:#141413;color:#E8E6DE;padding:16px 20px;border-radius:12px;font-family:ui-monospace,monospace;font-size:12px;line-height:1.8'><pre style='margin:0'>inp_lat (8, 32, 16, 8, 8)\n  → <span style='color:#ffd23f'>input_proj</span>: Linear(16→512)  → (8, 32, 64, 512)  每帧 64 spatial tokens\n  → + spatial_pos + temporal_pos\n\n  → <span style='color:#D97757'>12 层 DiT Block</span>，每层:\n      x += <span style='color:#D97757'>action_bias</span>(action_onehot)          ← 动作注入 (每层独立 Linear)\n      x += <span style='color:#46d3ff'>SpatialSelfAttn</span>(LN(x))             ← 帧内 64 token full attn\n      x += <span style='color:#46d3ff'>TemporalCausalAttn</span>(LN(x))          ← 帧间 causal (t 只看 ≤t)\n      x += <span style='color:#788C5D'>CrossAttn</span>(LN(x), code, code_mask)   ← 源码条件注入\n      x += FFN(LN(x))\n\n  → <span style='color:#ffd23f'>output_proj</span>: Linear(512→16)  → pred_lat (8, 32, 16, 8, 8)\n  → <span style='color:#46d3ff'>reward_head</span>: pool spatial → Linear(512→3) → (8, 32, 3)\n  → <span style='color:#788C5D'>done_head</span>:   pool spatial → Linear(512→2) → (8, 32, 2)</pre></div>"},
+
+  {"type":"html","html":"<div style='border-left:3px solid #D97757;background:#FAF3EF;padding:12px 16px;border-radius:0 10px 10px 0;margin-top:12px'><b>Teacher Forcing 关键点:</b> 每帧位置 t 的输入<b>永远是 GT latent</b>（不是自己上一步的预测）。Temporal Causal Attention 保证 t 只看 0..t，不偷看未来帧。训练时不存在误差累积；推理时改为自回归（用自己的预测当下一步输入）才会有。</div>"},
+
+  {"type":"html","html":"<h2>Step ④ — Loss 计算</h2>"},
+
+  {"type":"html","html":"<div style='background:#141413;color:#E8E6DE;padding:14px 18px;border-radius:10px;font-family:ui-monospace,monospace;font-size:13px;line-height:1.7'>L = <span style='color:#D97757'>MSE(pred_lat, tgt_lat)</span> + 0.1 × <span style='color:#46d3ff'>CE(rew_logits, reward_cls)</span> + 0.1 × <span style='color:#788C5D'>CE(done_logits, done_cls)</span></div>"},
+
+  {"type":"html","html":"<h3><span style='color:#D97757'>主损失: Latent MSE</span></h3><p>逐元素 MSE between predicted latent 和 GT next-frame latent, shape (B, T, 16, 8, 8)。这是训练的<b>核心驱动力</b>——让模型学会「给定 code + action + 当前帧 → 预测下一帧 latent」。</p>"},
+
+  {"type":"html","html":"<h3><span style='color:#46d3ff'>辅助: Reward 分类 (CE)</span></h3><p>原始 reward 是浮点（CoinRun 里大多数步=0，到达金币=10），<b>量化成 3 类</b>后做分类:</p><div style='background:#141413;color:#E8E6DE;padding:12px 16px;border-radius:8px;font-family:ui-monospace,monospace;font-size:12px;line-height:1.6'>reward_cls = sign(reward) + 1\n\n  reward &lt; 0   → sign=-1 → cls=<span style='color:#D97757'>0</span>  (惩罚)\n  reward = 0   → sign=0  → cls=<span style='color:#E8E6DE'>1</span>  (无事发生, 绝大多数步)\n  reward &gt; 0   → sign=+1 → cls=<span style='color:#788C5D'>2</span>  (得分, 如到达金币 +10)</div><p style='margin-top:8px'>DiT pool spatial tokens → Linear(512,3) → 3 logits → CrossEntropy。模型学的是:<b>看当前状态+动作+code，判断这一步有没有得分</b>。</p>"},
+
+  {"type":"html","html":"<h3><span style='color:#788C5D'>辅助: Done 分类 (CE)</span></h3><p>done 是 bool，直接当 <b>2 分类</b>:</p><div style='background:#141413;color:#E8E6DE;padding:12px 16px;border-radius:8px;font-family:ui-monospace,monospace;font-size:12px;line-height:1.6'>done_cls = 0 (episode 继续) 或 1 (episode 终止)\n\n终止条件 (写在 coinrun.cpp 里):\n  碰到敌人  → done\n  碰到锯齿  → done\n  掉进熔岩  → done\n  到达金币  → done (success)</div><p style='margin-top:8px'>DiT pool → Linear(512,2) → 2 logits → CrossEntropy。模型学的是:<b>判断 episode 是否应该结束</b>。</p>"},
+
+  {"type":"html","html":"<div style='border-left:3px solid #788C5D;background:#F4F6EF;padding:12px 16px;border-radius:0 10px 10px 0'><b>为什么要辅助 loss:</b> 它们不直接影响画面预测（画面靠 MSE），但逼模型在 latent 表示里编码游戏的<b>语义状态</b>——「快碰到敌人了」「到达金币了」。没有它们，模型可能只学到像素层面的「下一帧长什么样」但不理解为什么；有了它们，内部表示更接近「游戏状态」而非「像素分布」，对 long-horizon rollout 稳定性有帮助。<br><br>系数 0.1 = 不让辅助 loss 主导训练，主力还是 latent MSE。</div>"},
+
+  {"type":"html","html":"<h2>Step ⑤ — Backward + Optimizer</h2>"},
+
+  {"type":"table","head":["参数","值"],"rows":[["AMP","bf16 (autocast)"],["optimizer","AdamW"],["lr","3e-4 peak, cosine decay, 500-step warmup"],["weight_decay","0.01"],["grad_clip","1.0"],["batch_size","8 (单卡)"]]},
+
+  {"type":"html","html":"<h2>Step ⑥ — 周期性事件</h2>"},
+
+  {"type":"table","head":["事件","频率","做什么"],"rows":[["log","每 50 步","打印 loss / lr / 速度 (it/s)"],["eval","每 1000 步","跑 eval_loader 20 batch，打印 eval loss"],["sample","每 2000 步","加载 VAE decode 一个 eval clip，存对比图 (GT vs pred)"],["checkpoint","每 2000 步","存 ckpt_XXXXXX.pt + ckpt_last.pt 到 runs/ 目录"]]},
+
+  {"type":"html","html":"<h2>模型参数分布</h2>"},
+
+  {"type":"table","head":["组件","参数量","占比","说明"],"rows":[["blocks (12层 DiT)","63.12M","99.2%","spatial attn + temporal causal attn + cross-attn + action bias + FFN"],["code_proj","0.46M","0.7%","Linear(896→512), Qwen→DiT 投影"],["spatial_pos","0.03M","","64 位置 × 512 dim"],["input/output_proj","各 0.01M","","latent 16ch ↔ embed 512"],["temporal_pos","0.01M","","32 帧 × 512 dim"],["reward/done heads","< 0.01M","","小 linear"],["总计","63.65M","100% 可训练","VAE 和 Qwen 冻结预编码, 不参与训练"]]},
+
+  {"type":"html","html":"<h2>数据集概览</h2>"},
+
+  {"type":"table","head":["项","值"],"rows":[["训练样本","16,855 窗口 (T=32)"],["评估样本","696 窗口"],["总 episodes","18,200 (7 变体 × 2600)"],["总帧数","2,131,839"],["latent 存储","4.39 GB (fp16)"],["code embeds","7 × ~4600 tokens × 896 dim"],["每样本","latents(33,16,8,8) + actions(32,) + code(~4600,896)"]]},
+
+  {"type":"html","html":"<h2>推理时 (训练后)</h2><p>训练是 teacher forcing, 推理改为<b>自回归</b>:</p><div style='background:#141413;color:#E8E6DE;padding:14px 18px;border-radius:10px;font-family:ui-monospace,monospace;font-size:12px;line-height:1.7'><pre style='margin:0'>给定 frame_0 latent + action 序列 + code\n\nfor t in range(T):\n    pred_t = model(past_latents, action_t, code)  <span style='color:#788C5D'>← 用自己预测的 latent 当输入</span>\n    past_latents.append(pred_t)\n\ndecode all pred_latents → Wan VAE → 64×64 video</pre></div><p style='color:#888;margin-top:8px'>推理时误差会累积（每步预测的微小偏差传到下一步），所以 long-horizon rollout 稳定性是核心评估指标。</p>"}
+]
+</script>
+
+<script src="/__assets/katex.min.js"></script>
+<script src="/__assets/notebook.js"></script>
+<script>HtmlVibeNotebook.mount(JSON.parse(document.getElementById('seed').textContent));</script>
+</body>
+</html>

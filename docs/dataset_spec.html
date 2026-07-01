@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Code2world — 数据集设计规格</title>
+<link rel="stylesheet" href="/__assets/notebook.css">
+<link rel="stylesheet" href="/__assets/katex.min.css">
+</head>
+<body>
+<div class="page">
+  <div class="toolbar">
+    <button class="btn primary" id="save">保存到文件</button>
+    <button class="btn ghost sm" id="copy">复制 Markdown</button>
+    <span class="hint" id="hint">cell 双击编辑 · Shift+↵ 完成 · Ctrl+S 保存 · 拖 ⠿ 重排 · cell 间双击插入</span>
+  </div>
+  <div id="nb"></div>
+</div>
+
+<script id="seed" type="application/json">
+[
+  {"type":"html","html":"<h1 style='margin-bottom:4px'>Code2world — 数据集设计规格</h1><p style='color:#888;margin-top:0'>单游戏 CoinRun · 7 个固定档位参数变体 · 源码+高亮 code condition · 预编码 latent · 训练集含配对 / 评估集全配对</p>"},
+
+  {"type":"html","html":"<h2>已敲定的决策</h2>"},
+
+  {"type":"table","head":["决策","选择"],"rows":[["游戏范围","单游戏 CoinRun（窄而深）"],["变体维度","改物理参数，7 个固定离散档位，单变量"],["code 形式","完整 source.cpp + 改动行高亮注释"],["VAE latent","离线预编码，存 fp16"],["窗口 T","存完整 episode，训练时截取；默认 ~5s（≈75帧，可调）"],["每变体规模","2000–3000 episodes"],["配对策略","训练集放一部分配对 + 评估集全配对"],["动作采样","只在有效动作 0~8 抽（CoinRun 用不到 9~14）"],["reward 变体","暂不做"]]},
+
+  {"type":"html","html":"<h2>1. 七个参数变体</h2><p>围绕 3 个视觉影响大的物理参数，每个单独改一个值（单变量，最利于 code sensitivity 对比）。</p>"},
+
+  {"type":"table","head":["变体名","改动参数","默认 → 变体值","视觉效果"],"rows":[["base","（无）","全默认","基准"],["fast","maxspeed","0.5 → 0.9","水平移动更快"],["slow","maxspeed","0.5 → 0.25","水平移动更慢"],["lowgrav","gravity","0.2 → 0.1","下落慢、飘"],["highgrav","gravity","0.2 → 0.35","下落快、沉"],["highjump","max_jump","1.5 → 2.5","跳更高"],["lowjump","max_jump","1.5 → 0.9","跳更矮"]]},
+
+  {"type":"html","html":"<h2>2. Code Condition：源码 + 高亮</h2><p>每个变体存一份完整 <code>source.cpp</code>，改动行加行内注释让 Qwen 注意到那几个改动的数字（变体间 99% 源码相同）：</p><div style='background:#141413;color:#E8E6DE;padding:14px 18px;border-radius:10px;font-family:ui-monospace,monospace;font-size:12px;line-height:1.7'><pre style='margin:0'><span style='color:#888'>// fast 变体的 game_reset():</span>\n        gravity = 0.2f;\n        max_jump = 1.5;\n        air_control = 0.15f;\n        maxspeed = <span style='color:#ffd23f'>0.9f</span>;   <span style='color:#788C5D'>// [VARIANT] changed from 0.5 (faster horizontal speed)</span></pre></div><p style='color:#888'>注释统一格式 <code>// [VARIANT] changed from &lt;old&gt; (&lt;说明&gt;)</code>，base 变体无此注释。</p>"},
+
+  {"type":"html","html":"<h2>3. 配对 vs 非配对数据</h2><div style='border-left:3px solid #D97757;background:#FAF3EF;padding:14px 18px;border-radius:0 10px 10px 0'><b>配对样本 =</b> 同一个 <b>关卡 seed</b> + 同一串 <b>动作序列</b>，跑过全部 7 个变体 → 得到 7 条只有物理参数不同的轨迹。这是验证 code sensitivity 最干净的对照。<br><br>Procgen 在「关卡 seed + 动作序列」固定时是<b>确定性</b>的，所以配对可复现。（注：变体不同可能提前死亡/到达终点，配对轨迹长度未必相等，逐帧比到 min 长度即可。）</div>"},
+
+  {"type":"table","head":["数据集","构成","目的"],"rows":[["训练集","大部分非配对（各变体随机 seed+随机动作） + 一部分配对（固定 seed 集合跑全变体）","非配对保多样性；配对样本强化「同布局动作→不同参数→不同结果」的 code 信号"],["评估集","全配对（held-out seed，跑全变体）","量化 code sensitivity：同输入下模型预测是否随参数改变"]]},
+
+  {"type":"html","html":"<h2>4. 动作序列</h2><ul style='line-height:1.9'><li><b>采样范围</b>：只在 action id <code>0~8</code> 抽（3×3 方向网格），跳过 CoinRun 无效的 9~14</li><li><b>非配对样本</b>：每步独立随机（可选加惯性让轨迹更像目的性移动）</li><li><b>配对样本</b>：动作序列由「关卡 seed 派生的固定 numpy 种子」生成，保证跨变体复用同一串动作</li><li><b>动作语义来自 code</b>：CoinRun 的 <code>set_action_xy</code> 把 action 解释为方向，这本身写在源码里（博客说的 action schema from code）</li></ul>"},
+
+  {"type":"html","html":"<h2>5. 存储结构（两层）</h2>"},
+
+  {"type":"html","html":"<div style='background:#141413;color:#E8E6DE;padding:14px 18px;border-radius:10px;font-family:ui-monospace,monospace;font-size:12px;line-height:1.7'><pre style='margin:0'>data/dataset/\n├── variants.json              <span style='color:#788C5D'># 变体清单: 名字 → 改动参数/值 + source.cpp 路径</span>\n├── &lt;variant&gt;/                  <span style='color:#788C5D'># base, fast, slow, lowgrav, highgrav, highjump, lowjump</span>\n│   ├── source.cpp             <span style='color:#788C5D'># 该变体完整源码（含高亮注释）</span>\n│   ├── episodes_train.npz     <span style='color:#788C5D'># 非配对训练 episodes (frames/actions/rewards/dones/lengths)</span>\n│   └── episodes_paired.npz    <span style='color:#788C5D'># 配对 episodes（与其他变体共享 seed 集合）</span>\n├── code_embeds.pt             <span style='color:#788C5D'># {variant: Qwen(source.cpp) → (N_tok, 896)}  预编码一次</span>\n└── latents/\n    └── &lt;variant&gt;_*.npz        <span style='color:#788C5D'># 预编码 VAE latent (T, 16, 8, 8) fp16</span></pre></div>",
+   "_comment":""},
+
+  {"type":"html","html":"<div style='border-left:3px solid #788C5D;background:#F4F6EF;padding:12px 16px;border-radius:0 10px 10px 0'><b>两个预编码优化：</b><ul style='margin:4px 0 0 0;padding-left:18px;line-height:1.8'><li><b>VAE latent 预编码</b>：所有帧离线过 VAE 存 fp16 latent（16×8×8）。训练时不加载/不跑 VAE，省显存又快。</li><li><b>Code embedding 预编码</b>：同变体所有 episode 共享一份 Qwen 输出，离线编码一次存 <code>code_embeds.pt</code>，训练时查表，不必加载 Qwen。</li></ul></div>"},
+
+  {"type":"html","html":"<h2>6. 训练时 Dataset.__getitem__</h2><div style='background:#141413;color:#E8E6DE;padding:14px 18px;border-radius:10px;font-family:ui-monospace,monospace;font-size:12px;line-height:1.7'><pre style='margin:0'>1. 随机选一个 (variant, episode)\n2. 在该 episode 内随机截一段连续 T+1 帧窗口\n3. 返回 {\n     \"latents\":  (T+1, 16, 8, 8) fp16  <span style='color:#788C5D'># 预编码 latent</span>\n     \"actions\":  (T,)  int                <span style='color:#788C5D'># 0~8</span>\n     \"rewards\":  (T,)  float\n     \"dones\":    (T,)  bool\n     \"code\":     (N, 896)               <span style='color:#788C5D'># 查 code_embeds[variant]</span>\n   }\n\n窗口 T 是训练配置（默认 ~5s≈75帧），存储与 T 解耦，改 T 不用重采</pre></div>"},
+
+  {"type":"html","html":"<h2>7. 采集流程（per variant）</h2><div style='background:#141413;color:#E8E6DE;padding:14px 18px;border-radius:10px;font-family:ui-monospace,monospace;font-size:12px;line-height:1.7'><pre style='margin:0'>for variant in [base, fast, slow, ...]:\n    1. 改 coinrun.cpp 对应参数 + 加 [VARIANT] 注释\n    2. 重新编译 (import procgen 自动 rebuild)\n    3. 采集非配对 episodes (随机 seed + 随机动作 0~8) → episodes_train.npz\n    4. 采集配对 episodes (固定 seed 集合 + 派生动作)   → episodes_paired.npz\n    5. 拷贝当前 coinrun.cpp → &lt;variant&gt;/source.cpp\n    6. 恢复原始 coinrun.cpp\n\n之后离线预编码:\n    - 所有帧 → Wan VAE → latents/  (fp16)\n    - 所有 source.cpp → Qwen → code_embeds.pt</pre></div>"},
+
+  {"type":"html","html":"<h2>规模估算</h2>"},
+
+  {"type":"table","head":["项","估算"],"rows":[["变体数","7"],["每变体 episodes","~2500（非配对 ~2200 + 配对 ~300）"],["总 episodes","~17500"],["总帧数","~17500 × 118 ≈ 200万帧"],["预编码 latent (fp16)","200万 × 16×8×8 × 2byte ≈ 4GB"],["code_embeds","7 × (~2K tok × 896 × 2byte) ≈ 25MB"],["采集耗时","每变体重编译~1min + 采集~30s，7 变体 ≈ 15min"]]},
+
+  {"type":"html","html":"<div style='border-left:3px solid #D97757;background:#FAF3EF;padding:14px 18px;border-radius:0 10px 10px 0'><b>待你最终确认：</b>① 窗口默认 ~5s(75帧) 偏长、显存重，是否先用更短(如32帧)起步？②「非配对/配对」比例（建议 ~85% / 15%）③ 配对用多少个 held-out seed 给评估集。其余设计若 OK 即可开始写采集 + 预编码 + dataset 代码。</div>"}
+]
+</script>
+
+<script src="/__assets/katex.min.js"></script>
+<script src="/__assets/notebook.js"></script>
+<script>HtmlVibeNotebook.mount(JSON.parse(document.getElementById('seed').textContent));</script>
+</body>
+</html>

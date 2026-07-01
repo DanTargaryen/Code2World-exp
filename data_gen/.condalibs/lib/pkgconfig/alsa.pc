@@ -1,0 +1,12 @@
+prefix=/mnt/pfs/users/huangzehuan/projects/linming/data_gen/.condalibs
+exec_prefix=/mnt/pfs/users/huangzehuan/projects/linming/data_gen/.condalibs
+libdir=${exec_prefix}/lib
+includedir=${prefix}/include
+
+Name: alsa
+Description: Advanced Linux Sound Architecture (ALSA) - Library
+Version: 1.2.16.1
+Requires: 
+Libs: -L${libdir} -lasound
+Libs.private: -lm -lpthread -lrt
+Cflags: -I${includedir}

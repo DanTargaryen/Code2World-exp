@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Code2world — 第一阶段训练总结</title>
+<link rel="stylesheet" href="/__assets/notebook.css">
+<link rel="stylesheet" href="/__assets/katex.min.css">
+</head>
+<body>
+<div class="page">
+  <div class="toolbar">
+    <button class="btn primary" id="save">保存到文件</button>
+    <button class="btn ghost sm" id="copy">复制 Markdown</button>
+    <span class="hint" id="hint">cell 双击编辑 · Shift+↵ 完成 · Ctrl+S 保存 · 拖 ⠿ 重排 · cell 间双击插入</span>
+  </div>
+  <div id="nb"></div>
+</div>
+
+<script id="seed" type="application/json">
+[
+  {"type":"html","html":"<h1 style='margin-bottom:4px'>Code2world — 第一阶段训练总结</h1><p style='color:#888;margin-top:0'>Procgen CoinRun · Wan2.1 VAE + Causal DiT + Qwen2.5 code condition · 20K steps 跑通端到端</p>"},
+
+  {"type":"html","html":"<div style='border-left:3px solid #788C5D;background:#F4F6EF;padding:14px 18px;border-radius:0 10px 10px 0'><b>一句话结论：</b>code-conditioned AR world model 的完整管线（数据→VAE→DiT→训练→自回归生成）已<b>全部跑通</b>，loss 健康收敛、无过拟合、能生成连贯视频。当前主要短板是<b>生成画面偏糊</b>——这是 MSE 回归 + 自回归误差累积的预期现象，是第二阶段要解决的核心问题。</div>"},
+
+  {"type":"html","html":"<h2>1. 已完成的全链路</h2>"},
+
+  {"type":"table","head":["阶段","内容","结果"],"rows":[["数据采集","7 个 CoinRun 参数变体 × 2600 episodes (含配对)","✅ 218万帧, 配对正确"],["VAE 预编码","Wan 2.1 VAE 8× 空间压缩 → 8×8×16 latent (fp16)","✅ PSNR 29.5dB, 4.4GB"],["Code 预编码","Qwen2.5-0.5B 编码 7 份 coinrun.cpp 源码","✅ 完整零截断 (~4600 tok)"],["模型","Causal DiT: spatial+temporal causal+cross-attn+action bias","✅ 63.6M 全可训练"],["训练","20K steps, bf16, AdamW cosine, ~1.9h 单卡","✅ loss 收敛"],["推理","自回归 rollout (128 帧) + VAE decode → 视频","✅ base/fast 视频已出"]]},
+
+  {"type":"html","html":"<h2>2. 训练曲线</h2><p>Train loss (主) 与 Eval loss (held-out 配对集)，latent MSE 为主导项，reward/done 辅助 loss 早早降到 ~0。</p>"},
+
+  {"type":"table","head":["step","train loss","eval loss"],"rows":[["0","1.126","—"],["2000","0.0213","0.0273"],["4000","0.0118","0.0128"],["6000","0.0093","0.0098"],["8000","0.0076","0.0064"],["10000","0.0067","0.0054"],["12000","0.0058","0.0053"],["14000","0.0055","0.0047"],["16000","0.0048","0.0043"],["18000","0.0047","0.0042"],["20000","0.0046","0.0040"]]},
+
+  {"type":"html","html":"<div style='border-left:3px solid #788C5D;background:#F4F6EF;padding:12px 16px;border-radius:0 10px 10px 0'><b>曲线解读：</b>① 平滑单调下降，无震荡/发散；② <b>eval &lt; train</b>（0.0040 vs 0.0046），完全没有过拟合，说明数据量足够、模型容量没浪费；③ 后期（16K+）下降趋缓但仍在降，说明再训更久或更大模型还有空间。</div>"},
+
+  {"type":"html","html":"<h2>3. 最终指标</h2>"},
+
+  {"type":"table","head":["指标","值"],"rows":[["最终 train loss","0.00456 (latent 0.00442)"],["最终 eval loss","0.00399 (latent 0.00391)"],["reward / done loss","≈ 0 (辅助任务已学会)"],["训练速度","2.97 it/s (单卡 A800, bf16)"],["总耗时","~1.9 小时 (20K steps)"],["模型参数","63.6M (100% 可训练)"],["checkpoint","11 个, final 764MB"]]},
+
+  {"type":"html","html":"<h2>4. 「糊」的根因分析 ⚠️</h2><p>当前自回归生成的画面偏模糊，这<b>不是 bug</b>，是当前设计的几个已知机制叠加的结果。按影响大小排序：</p>"},
+
+  {"type":"table","head":["根因","机制","影响"],"rows":[["① MSE 回归到均值","下一帧有多种合理走向(玩家可能左/右/跳)，MSE 让模型预测所有可能的'平均'，平均的结果就是模糊","⭐⭐⭐ 主因"],["② 自回归误差累积","rollout 用自己的预测当下一步输入，每帧微小误差逐帧放大，越往后越糊/漂移","⭐⭐⭐ 主因"],["③ 连续 latent 空间","连续 latent + MSE 比离散 token + 交叉熵更易糊(后者是分类，天然锐利)","⭐⭐ 次要"],["④ VAE 重建上限","单帧 roundtrip PSNR 29.5dB 已是上限，但这是固定上限非主因","⭐ 轻微"],["⑤ 训练/容量","20K steps、63M 参数可能未完全收敛到锐利","⭐ 轻微"]]},
+
+  {"type":"html","html":"<div style='border-left:3px solid #D97757;background:#FAF3EF;padding:14px 18px;border-radius:0 10px 10px 0'><b>关键洞察：</b>① 和 ② 是 world model 的经典难题。MSE 回归均值是<b>所有用 L2 预测下一帧的模型都会糊</b>的根本原因——这也是为什么 GameNGen / Oasis / DIAMOND 都用 <b>diffusion</b> 而非 MSE。Diffusion/flow matching 建模的是<b>分布</b>而非均值，能采样出锐利的某一个合理结果，是解决模糊最直接有效的方法（我们计划里早就留了'MSE→flow matching 升级'这条路）。</div>"},
+
+  {"type":"html","html":"<h2>5. 后续规划</h2>"},
+
+  {"type":"html","html":"<h3>Stage 2 — 解决模糊（优先级最高）</h3>"},
+
+  {"type":"table","head":["方案","做法","预期","成本"],"rows":[["A. Flow matching head (推荐)","把 output 从 MSE 回归改成每帧 1-step flow matching，建模 latent 分布而非均值","锐度大幅提升，仍保持 AR + teacher forcing","中：改 loss + 推理加 1-step denoise"],["B. 离散 VQ token + CE","换成 VQ-VAE，预测离散 token，cross-entropy","天然锐利(分类)，但要重训 tokenizer","高：重做 VAE"],["C. 加 perceptual/GAN loss","MSE 基础上加 LPIPS 或对抗损失","锐度改善，训练不稳","中"],["D. 先验证是否训练不足","延长到 50K steps / 加大模型","可能只是部分改善","低：直接重训"]]},
+
+  {"type":"html","html":"<div style='border-left:3px solid #D97757;background:#FAF3EF;padding:12px 16px;border-radius:0 10px 10px 0'><b>建议先做 A (flow matching)</b>：它针对模糊主因(MSE 均值化)，且不破坏现有 AR/teacher-forcing 框架和已有数据。D (延长训练) 可以并行先跑一个 50K steps 看是否部分缓解，成本最低。</div>"},
+
+  {"type":"html","html":"<h3>Stage 3 — Code Sensitivity 量化评估（核心命题）</h3><p>这是验证'模型真的读懂了 code'的关键实验，数据已全部就绪（7 变体配对集）：</p><ul style='line-height:1.9'><li>同一 held-out seed + 同动作，喂不同变体源码 → 测生成画面是否随 code 改变</li><li>例：fast vs base，玩家水平移动速度是否真的更快；lowgrav vs base，跳跃弧线是否更飘</li><li>量化指标：用真值轨迹对比，算'生成轨迹随 code 改变的方向正确率'</li><li>对照实验：把 code condition 置零/打乱，看预测是否退化（证明 code 有信息增益）</li></ul>"},
+
+  {"type":"html","html":"<h3>Stage 4 — 鲁棒性 & 扩展</h3>"},
+
+  {"type":"table","head":["方向","内容"],"rows":[["Long-horizon rollout","测 100/300/500 步稳定性，看状态漂移；可引入 rollout 时加噪训练抗累积误差"],["更长上下文","window 32 → 64，看长时序依赖是否改善"],["多卡加速","DDP 8 卡，支持更大 batch / 更长训练 / 更大模型"],["跨游戏扩展","加 maze/bigfish 等机制差异大的游戏，验证 code condition 的泛化"],["连续参数采样","当前 7 个固定档位 → 连续采样 maxspeed∈[0.25,0.9]，逼模型真正'读数值'"]]},
+
+  {"type":"html","html":"<h2>6. 当前产物清单</h2>"},
+
+  {"type":"table","head":["产物","路径"],"rows":[["数据集","/mnt/pfs/data/huangzehuan/datasets/code2world/ (6.4GB)"],["checkpoints","checkpoints/code2world/ (ckpt_final.pt 等 11 个)"],["训练日志","model/train_run.log"],["生成视频","model/rollout_out/ (base/fast × original/generated/compare)"],["视频查看页","model/rollout_view.html"],["训练 pipeline 说明","training_pipeline.html"]]},
+
+  {"type":"html","html":"<div style='border-left:3px solid #788C5D;background:#F4F6EF;padding:14px 18px;border-radius:0 10px 10px 0;margin-top:8px'><b>第一阶段定位：</b>这是<b>可行性验证（proof-of-concept）</b>——证明了 code→action→video 的 AR world model 闭环能跑通、能学、能生成。画面质量(锐度)是第二阶段的优化目标，不影响第一阶段'管线成立'的结论。下一步建议：先做 Stage 3 的 code sensitivity 评估（用现有模型即可，回答最核心的科学问题），同时并行启动 Stage 2 的 flow matching 改造解决模糊。</div>"}
+]
+</script>
+
+<script src="/__assets/katex.min.js"></script>
+<script src="/__assets/notebook.js"></script>
+<script>HtmlVibeNotebook.mount(JSON.parse(document.getElementById('seed').textContent));</script>
+</body>
+</html>

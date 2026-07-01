@@ -1,0 +1,8 @@
+# 训练/推理产物、日志、缓存(不进版本控制)
+model/outputs/
+model/runs/
+**/__pycache__/
+*.log
+*.pt
+*.mp4
+*.png

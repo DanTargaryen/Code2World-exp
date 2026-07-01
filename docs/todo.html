@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Code2world — 项目进度 Todo</title>
+<link rel="stylesheet" href="/__assets/notebook.css">
+<link rel="stylesheet" href="/__assets/katex.min.css">
+</head>
+<body>
+<div class="page">
+  <div class="toolbar">
+    <button class="btn primary" id="save">保存到文件</button>
+    <button class="btn ghost sm" id="copy">复制 Markdown</button>
+    <span class="hint" id="hint">cell 双击编辑 · Shift+↵ 完成 · Ctrl+S 保存 · 拖 ⠿ 重排 · cell 间双击插入</span>
+  </div>
+  <div id="nb"></div>
+</div>
+
+<script id="seed" type="application/json">
+[
+  {"type":"html","html":"<h1 style='margin-bottom:4px'>Code-Conditioned World Model — 项目进度</h1><p style='color:#888;margin-top:0'>基于 <code>plans/code_conditioned_world_model_blog.pdf</code> 的 6 阶段路线图，对照当前代码实际完成状态</p>"},
+
+  {"type":"html","html":"<div style='display:flex;gap:12px;flex-wrap:wrap;margin-bottom:8px'><div style='background:#788C5D;color:#fff;padding:6px 14px;border-radius:20px;font-size:13px;font-weight:600'>Stage 1 — 数据管线 ▸ 进行中</div><div style='background:#D1CFC5;color:#3D3D3A;padding:6px 14px;border-radius:20px;font-size:13px'>Stage 2 — 训练 ▸ 未开始</div><div style='background:#D1CFC5;color:#3D3D3A;padding:6px 14px;border-radius:20px;font-size:13px'>Stage 3 — 反事实评估 ▸ 未开始</div><div style='background:#D1CFC5;color:#3D3D3A;padding:6px 14px;border-radius:20px;font-size:13px'>Stage 4~6 ▸ 远期</div></div>"},
+
+  {"type":"html","html":"<hr style='border:none;border-top:2px solid #D1CFC5;margin:20px 0'><h2>Stage 1：小型程序化游戏数据集</h2><p style='color:#888'>目标：把 code → action → state → video 的闭环跑通，在多个小型游戏上大规模采集对齐数据</p>"},
+
+  {"type":"html","html":"<h3>1.1 数据管线基础设施</h3>"},
+
+  {"type":"html","html":"<div style='border:1.5px solid #788C5D;border-radius:12px;background:#F4F6EF;padding:14px 18px;margin-bottom:10px'><div style='display:flex;align-items:center;gap:8px'><span style='font-size:18px'>✅</span><b>通用录制管线 (recorder.mjs)</b></div><p style='margin:6px 0 0 26px;color:#555'>headless chromium + playwright → step 循环 + 帧捕获 + dump。游戏文件通过标准接口 (<code>__init/__reset/__step/__state/__schema/__grab</code>) 解耦，加新游戏零改管线。</p></div>"},
+
+  {"type":"html","html":"<div style='border:1.5px solid #788C5D;border-radius:12px;background:#F4F6EF;padding:14px 18px;margin-bottom:10px'><div style='display:flex;align-items:center;gap:8px'><span style='font-size:18px'>✅</span><b>确定性引擎 (rng.js + mulberry32)</b></div><p style='margin:6px 0 0 26px;color:#555'>全程禁用 Math.random/Date，(seed, params, actions) 唯一确定每一帧——反事实实验的地基。</p></div>"},
+
+  {"type":"html","html":"<div style='border:1.5px solid #788C5D;border-radius:12px;background:#F4F6EF;padding:14px 18px;margin-bottom:10px'><div style='display:flex;align-items:center;gap:8px'><span style='font-size:18px'>✅</span><b>批量 CLI (generate.mjs)</b></div><p style='margin:6px 0 0 26px;color:#555'>支持 <code>--game / --episodes / --steps / --seed-start / --variant / --params / --config</code>。</p></div>"},
+
+  {"type":"html","html":"<div style='border:1.5px solid #788C5D;border-radius:12px;background:#F4F6EF;padding:14px 18px;margin-bottom:10px'><div style='display:flex;align-items:center;gap:8px'><span style='font-size:18px'>✅</span><b>自检脚本 (verify.mjs) — 3 项 PASS</b></div><p style='margin:6px 0 0 26px;color:#555'>确定性 (同 seed md5 一致) + 速度反事实 + 按键映射反事实。</p></div>"},
+
+  {"type":"html","html":"<div style='border:1.5px solid #788C5D;border-radius:12px;background:#F4F6EF;padding:14px 18px;margin-bottom:10px'><div style='display:flex;align-items:center;gap:8px'><span style='font-size:18px'>✅</span><b>可配置规则体系 (本轮改造)</b></div><p style='margin:6px 0 0 26px;color:#555'>DIRS / key_binding / action_names 移入 DEFAULT_PARAMS，支持 <code>--config</code> JSON 文件覆盖。meta.json 含 effective_params（完整合并参数）。3 个预置 config。</p></div>"},
+
+  {"type":"html","html":"<div style='border:1.5px solid #788C5D;border-radius:12px;background:#F4F6EF;padding:14px 18px;margin-bottom:10px'><div style='display:flex;align-items:center;gap:8px'><span style='font-size:18px'>✅</span><b>无 root 渲染环境</b></div><p style='margin:6px 0 0 26px;color:#555'>three.js r160 本地打包，chromium-1223 swiftshader 软渲染 WebGL，conda alsa-lib 补缺。</p></div>"},
+
+  {"type":"html","html":"<h3>1.2 游戏覆盖</h3><p style='color:#888'>博客规划了 7 类游戏，目前只有 1 个。</p>"},
+
+  {"type":"table","head":["游戏类型","文件","状态","说明"],"rows":[["coin_collection","games/coin_collection.js","✅ 已完成","俯视 2D 捡金币，9 离散动作，确定性验证通过"],["navigation","—","🔲 未开始","博客计划：目标导航 + 墙壁障碍物"],["platformer","—","🔲 未开始","横版跳跃平台"],["shooter","—","🔲 未开始","简单射击"],["puzzle (switch-door)","—","🔲 未开始","开关谜题"],["racing","—","🔲 未开始","简单赛车"],["avoid obstacle","—","🔲 未开始","躲避障碍"]]},
+
+  {"type":"html","html":"<h3>1.3 策略覆盖</h3>"},
+
+  {"type":"table","head":["策略","文件","状态","说明"],"rows":[["random (带惯性)","policies/random.js","✅ 已完成","hold=0.85 惯性，不读 state，适合干净反事实"],["greedy / scripted","—","🔲 未开始","根据 state 决策（如追最近金币），动作跟随覆盖更强"],["human replay","—","🔲 未开始","录制人类玩家操作，最真实的动作分布"]]},
+
+  {"type":"html","html":"<h3>1.4 数据规模</h3>"},
+
+  {"type":"table","head":["数据项","当前","目标(博客建议)","差距"],"rows":[["游戏数","1 (coin_collection)","≥7 类","缺 6 类"],["episode 数","3 条 (base seed 0/1/2)","每游戏 20+ ep × 多 variant","差 ~几百条"],["变体集","0 个真正落盘的 variant","speed / radius / reward / dirs / key_binding","只有 verify 临时跑过"],["帧分辨率","256×256","256×256","✅ 达标"],["步数/条","300","300","✅ 达标"]]},
+
+  {"type":"html","html":"<h3>1.5 每条 episode 的数据产物（博客要求 vs 实际）</h3>"},
+
+  {"type":"table","head":["博客要求的数据项","对应文件","状态"],"rows":[["source code","source.js","✅"],["当前帧 / 连续视频","frames/ + video.mp4","✅"],["action trace","actions.jsonl","✅"],["object state","states.jsonl (player + coins)","✅"],["event log","events.jsonl","✅"],["reward / score","rewards.jsonl","✅"],["termination signal","meta.json terminate_reason","✅"],["hidden state (背包/CD等)","—","⚠️ coin_collection 无隐藏状态，需更复杂游戏才有"]]},
+
+  {"type":"html","html":"<hr style='border:none;border-top:2px solid #D1CFC5;margin:20px 0'><h2>Stage 2：基础训练任务</h2><p style='color:#888'>博客规划 3 类训练目标，目前 <b style='color:#D97757'>0 行代码</b></p>"},
+
+  {"type":"table","head":["训练任务","状态","说明"],"rows":[["Next-frame / next-clip generation","🔲 未开始","核心任务：给 (frame_t, action_t, code) → 预测 frame_{t+1}"],["Next-state prediction","🔲 未开始","结构化监督：预测 player 位置、coins 存活、score"],["Event prediction","🔲 未开始","预测 coin_collected / wall_hit / terminate 事件"]]},
+
+  {"type":"html","html":"<div style='border-left:3px solid #D97757;background:#FAF3EF;padding:12px 16px;border-radius:0 10px 10px 0'>博客特别强调：<b>只做像素预测不够</b>，必须让模型显式或隐式学到状态转移。否则会退化成「看起来像」而不是「真的会动」。建议 base model 用 Cosmos 3 (LLM + MoT)，天然具备 code understanding 能力。</div>"},
+
+  {"type":"html","html":"<hr style='border:none;border-top:2px solid #D1CFC5;margin:20px 0'><h2>Stage 3：Code Ablation / 反事实评估</h2><p style='color:#888'>博客称「最重要的实验之一」，目前 <b style='color:#D97757'>数据管线已支持，但模型侧未开始</b></p>"},
+
+  {"type":"table","head":["反事实维度","数据侧就绪","模型侧就绪","说明"],"rows":[["改 player_speed","✅ verify 通过","🔲","速度反事实"],["改 key_binding / dirs","✅ verify 通过 + configs/","🔲","按键语义反事实（本轮新增）"],["改 collision_radius","✅ params 已支持","🔲","碰撞判定反事实"],["改 coin_reward / score rule","✅ params 已支持","🔲","奖励规则反事实"],["改 coin_count","✅ params 已支持","🔲","场景复杂度反事实"],["改 enemy policy","🔲 无敌人游戏","🔲","需 shooter/navigation 游戏"]]},
+
+  {"type":"html","html":"<div style='border-left:3px solid #788C5D;background:#F4F6EF;padding:12px 16px;border-radius:0 10px 10px 0'>博客的最小成功标准：<b>改代码后模型预测跟着变</b>。如果模型只记住视频分布而忽略 code 条件，就会在反事实测试中失败。</div>"},
+
+  {"type":"html","html":"<hr style='border:none;border-top:2px solid #D1CFC5;margin:20px 0'><h2>Stage 4~6（远期）</h2>"},
+
+  {"type":"table","head":["阶段","目标","状态"],"rows":[["Stage 4: Long-horizon rollout","测 100/500/1000 步稳定性：物体消失正确？分数累计对？状态漂移？","🔲 远期"],["Stage 5: 复杂引擎","从 Three.js → UE / 更大 3D 游戏","🔲 远期"],["Stage 6: 泛化规则表示","executable code → pseudo-code / DSL / NL rule summary / structured rule card","🔲 远期"]]},
+
+  {"type":"html","html":"<hr style='border:none;border-top:2px solid #D1CFC5;margin:20px 0'><h2>评价指标（博客定义）</h2><p style='color:#888'>博客特别强调「不要只看 FVD/PSNR」</p>"},
+
+  {"type":"table","head":["指标","衡量什么","数据侧就绪"],"rows":[["action following accuracy","模型是否按动作改变画面","✅ actions.jsonl"],["state transition accuracy","物理量预测是否精确","✅ states.jsonl"],["event consistency","事件预测是否和 GT 一致","✅ events.jsonl"],["long-horizon stability","长期 rollout 状态是否漂移","✅ 可扩展 steps"],["code sensitivity / counterfactual correctness","改代码后模型是否跟着变","✅ config 体系 + verify"],["planning usefulness","agent 在神经引擎里规划 → 迁移到真实游戏有效","🔲 远期"]]},
+
+  {"type":"html","html":"<hr style='border:none;border-top:2px solid #D1CFC5;margin:20px 0'><h2>🎯 当前最优先的下一步</h2>"},
+
+  {"type":"html","html":"<div style='display:flex;flex-direction:column;gap:10px'><div style='border:1.5px solid #D97757;border-radius:12px;background:#fff;padding:14px 18px'><div style='display:flex;align-items:center;gap:8px'><span style='background:#D97757;color:#fff;border-radius:50%;width:24px;height:24px;display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:bold'>1</span><b>规模化生成反事实变体数据</b></div><p style='margin:6px 0 0 32px;color:#555'>管线和 config 体系已就绪。跑 20+ seed × 多个 variant（base / fast / swap_lr / wasd_only / reverse_all）落盘，形成真正可用的数据集。这是 Stage 1 从 demo 到 dataset 的关键一步。</p></div><div style='border:1.5px solid #D97757;border-radius:12px;background:#fff;padding:14px 18px'><div style='display:flex;align-items:center;gap:8px'><span style='background:#D97757;color:#fff;border-radius:50%;width:24px;height:24px;display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:bold'>2</span><b>写第二个游戏 navigation.js</b></div><p style='margin:6px 0 0 32px;color:#555'>博客要求多游戏覆盖。navigation（目标导航 + 墙壁碰撞）复杂度适中，与 coin_collection 差异大（有墙有路径规划），能检验管线的通用性。</p></div><div style='border:1.5px solid #D97757;border-radius:12px;background:#fff;padding:14px 18px'><div style='display:flex;align-items:center;gap:8px'><span style='background:#D97757;color:#fff;border-radius:50%;width:24px;height:24px;display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:bold'>3</span><b>加 greedy/scripted 策略</b></div><p style='margin:6px 0 0 32px;color:#555'>当前随机策略不读 state —— action following 覆盖弱（模型看到的动作和游戏状态关联性低）。加一个追最近金币的 greedy 策略，action 序列更有因果意义。</p></div></div>"}
+]
+</script>
+
+<script src="/__assets/katex.min.js"></script>
+<script src="/__assets/notebook.js"></script>
+<script>HtmlVibeNotebook.mount(JSON.parse(document.getElementById('seed').textContent));</script>
+</body>
+</html>

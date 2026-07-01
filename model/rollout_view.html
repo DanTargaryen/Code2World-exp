@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Code2world — AR Rollout 视频</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { background: #FAF9F5; color: #3D3D3A; font-family: system-ui, sans-serif; padding: 28px; line-height: 1.5; }
+h1 { font-family: Georgia, serif; font-size: 26px; margin-bottom: 4px; }
+.sub { color: #888; margin-bottom: 24px; }
+h2 { font-family: Georgia, serif; font-size: 19px; margin: 26px 0 12px; border-bottom: 2px solid #D1CFC5; padding-bottom: 6px; }
+.callout { border-left: 3px solid #D97757; background: #FAF3EF; padding: 12px 16px; border-radius: 0 10px 10px 0; margin: 14px 0; }
+.grid { display: flex; gap: 20px; flex-wrap: wrap; }
+.card { background: #fff; border: 1.5px solid #D1CFC5; border-radius: 14px; padding: 16px 18px; }
+.card h3 { font-size: 15px; margin-bottom: 4px; }
+.card .lbl { font-size: 12px; color: #888; margin-bottom: 10px; }
+video { width: 100%; border-radius: 8px; background: #141413; display: block; }
+.vlabel { display: flex; justify-content: space-around; font-size: 12px; color: #788C5D; font-weight: 600; margin-top: 6px; }
+code { font-family: ui-monospace, monospace; background: #E8E6DE; padding: 1px 5px; border-radius: 4px; font-size: 13px; }
+</style>
+</head>
+<body>
+<h1>Code2world — 自回归 Rollout 视频</h1>
+<p class="sub">CausalDiT (20K steps) · 自回归生成 vs 原始 Procgen · base 与 fast 变体（同 seed 配对）</p>
+
+<div class="callout">
+<b>怎么看：</b>每个视频是左右并排——<b>左 = 原始 Procgen 真实画面</b>，<b>右 = 模型自回归生成</b>。模型只看到了第 0 帧 latent + 动作序列 + 该变体的 coinrun.cpp 源码，之后每一帧都用自己上一步的预测继续往下生成（真正的 AR，非 teacher forcing），共 128 帧。
+</div>
+
+<h2>base 变体（默认物理）</h2>
+<div class="card" style="max-width:720px">
+<div class="lbl">eval episode 0 · 左：原始 · 右：生成（128 帧自回归）</div>
+<video src="rollout_out/base_ep0_compare.mp4" controls autoplay loop muted></video>
+<div class="vlabel"><span>← 原始 Procgen</span><span>模型生成 →</span></div>
+</div>
+
+<h2>fast 变体（maxspeed 0.5→0.9，同 seed 同动作）</h2>
+<div class="card" style="max-width:720px">
+<div class="lbl">eval episode 0 · 与 base 是配对样本（同关卡布局 + 同动作序列，仅 code 里 maxspeed 不同）</div>
+<video src="rollout_out/fast_ep0_compare.mp4" controls autoplay loop muted></video>
+<div class="vlabel"><span>← 原始 Procgen</span><span>模型生成 →</span></div>
+</div>
+
+<div class="callout">
+<b>code sensitivity 看点：</b>base 和 fast 是<b>配对样本</b>——同一个关卡 seed、同一串动作，唯一区别是喂给模型的 <code>coinrun.cpp</code> 里 <code>maxspeed</code> 不同（0.5 vs 0.9）。如果模型真的读懂了 code，fast 的生成画面里玩家水平移动应该更快。对比两个生成视频右侧的玩家移动速度即可判断模型是否对 code 敏感。
+</div>
+
+<h2>单独视频</h2>
+<div class="grid">
+  <div class="card" style="width:300px"><h3>base 原始</h3><video src="rollout_out/base_ep0_original.mp4" controls loop muted></video></div>
+  <div class="card" style="width:300px"><h3>base 生成</h3><video src="rollout_out/base_ep0_generated.mp4" controls loop muted></video></div>
+  <div class="card" style="width:300px"><h3>fast 原始</h3><video src="rollout_out/fast_ep0_original.mp4" controls loop muted></video></div>
+  <div class="card" style="width:300px"><h3>fast 生成</h3><video src="rollout_out/fast_ep0_generated.mp4" controls loop muted></video></div>
+</div>
+
+</body>
+</html>
