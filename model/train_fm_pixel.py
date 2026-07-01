@@ -27,8 +27,8 @@ from train_fm import compute_loss, evaluate, prep_batch  # reused, batch-dict ag
 
 
 def build_loaders(args):
-    tr = PixelDataset(args.root, "train", args.window, args.variants)
-    ev = PixelDataset(args.root, "eval", args.window, args.variants)
+    tr = PixelDataset(args.root, "train", args.window, args.variants, stride=args.stride)
+    ev = PixelDataset(args.root, "eval", args.window, args.variants, stride=args.stride)
     print(f"train windows: {len(tr)} | eval windows: {len(ev)}", flush=True)
     code_dim = next(iter(tr.code_embeds.values())).shape[1]
     train_dl = DataLoader(tr, batch_size=args.batch_size, shuffle=True,
@@ -73,8 +73,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--root", default="/mnt/pfs/data/huangzehuan/datasets/code2world_act6_tc")
     ap.add_argument("--out", default="/mnt/pfs/users/huangzehuan/projects/linming/checkpoints/code2world_act6_tc_pixel")
-    ap.add_argument("--window", type=int, default=41, help="frames-1 per window; latents = window+1")
+    ap.add_argument("--window", type=int, default=41, help="steps-1 per window; latents = window+1")
     ap.add_argument("--block_size", type=int, default=3)
+    ap.add_argument("--stride", type=int, default=1, help="frame subsample; =action_repeat(4) -> 4fps 1frame/action")
     ap.add_argument("--batch_size", type=int, default=8)
     ap.add_argument("--num_actions", type=int, default=9)
     ap.add_argument("--embed_dim", type=int, default=512)

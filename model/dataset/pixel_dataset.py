@@ -23,9 +23,10 @@ PATCH = 8
 
 class PixelDataset(Dataset):
     def __init__(self, root, split="train", window=41, variants=("base",),
-                 mean=None, std=None):
+                 mean=None, std=None, stride=1):
         self.root = root
-        self.window = window                              # frames-1; sample = window+1 frames
+        self.window = window                              # steps-1; sample = window+1 steps
+        self.stride = stride                              # frame subsample; stride==ar -> 4fps (1 frame/action)
         self.patch = PATCH
         self.code_embeds = torch.load(os.path.join(root, "code_embeds.pt"))
         self.variants = list(variants)
@@ -64,9 +65,10 @@ class PixelDataset(Dataset):
                 a_cursor = 0     # actions: each ep has K
                 for K in epl:
                     nfr = ar * K + 1
-                    # need window+1 frames within this episode
-                    if nfr >= window + 1:
-                        self.index.append((sid, f_cursor, a_cursor, K, ar))
+                    nsub = (nfr - 1) // self.stride + 1     # subsampled steps in this ep
+                    # need window+1 subsampled steps within this episode
+                    if nsub >= window + 1:
+                        self.index.append((sid, f_cursor, a_cursor, K, ar, nsub))
                     f_cursor += nfr
                     a_cursor += K
 
@@ -74,23 +76,26 @@ class PixelDataset(Dataset):
         return len(self.index)
 
     def __getitem__(self, i):
-        sid, f0, a0, K, ar = self.index[i]
+        sid, f0, a0, K, ar, nsub = self.index[i]
         sh = self.shards[sid]
         W = self.window
-        nfr = ar * K + 1
-        off = np.random.randint(0, nfr - (W + 1) + 1)          # window start within episode
-        fs = f0 + off
-        frames = sh["frames"][fs: fs + W + 1]                  # (W+1,H,W,3) uint8
+        st = self.stride
+        soff = np.random.randint(0, nsub - (W + 1) + 1)        # window start in subsampled steps
+        # raw frame indices of the W+1 subsampled steps
+        fidx = f0 + (soff + np.arange(W + 1)) * st             # (W+1,)
+        frames = sh["frames"][fidx]                            # (W+1,H,W,3) uint8
         # normalize + patchify -> (W+1, 192, 8, 8)
         x = frames.astype(np.float32) / 255.0
         x = (x - self.mean) / self.std
         x = torch.from_numpy(x).permute(0, 3, 1, 2)            # (W+1,3,H,W)
         lat = rearrange(x, "t c (h p1) (w p2) -> t (c p1 p2) h w",
                         p1=self.patch, p2=self.patch)          # (W+1,192,8,8)
-        # per-frame actions: window position j (j=1..W) = ep-frame off+j, action idx (off+j-1)//ar
+        # action for window pos j (1..W): subsampled step q=soff+j -> raw frame q*st,
+        # driven by episode action (q*st-1)//ar. stride==ar -> exactly a_{q-1} (1 frame/action).
         act = np.empty(W, np.int64)
         for j in range(1, W + 1):
-            act[j - 1] = sh["actions"][a0 + (off + j - 1) // ar]
+            q = soff + j
+            act[j - 1] = sh["actions"][a0 + (q * st - 1) // ar]
         act = torch.from_numpy(act)
         code = self.code_embeds[sh["variant"]].float()
         return {"latents": lat.float(), "actions": act, "code": code,

@@ -54,6 +54,8 @@ def main():
     ap.add_argument("--pixel", action="store_true",
                     help="pixel-space model: use PixelCodec (192-d 8x8 patch) not the VAE; "
                          "latents file is <variant>__<split>_pixel.pt (1 latent==1 frame)")
+    ap.add_argument("--stride", type=int, default=1,
+                    help="pixel-only frame subsample; =action_repeat(4) -> 4fps (1 frame/action)")
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
     dev = args.device
@@ -85,14 +87,18 @@ def main():
         d = np.load(os.path.join(args.root, args.variant, f"{args.split}.npz"))
         epl = d["episode_lengths"]
         ar = int(d["action_repeat"]) if "action_repeat" in d else 1
+        st = args.stride                                        # =ar -> 4fps (1 frame/action)
         f0 = int(sum(ar * int(k) + 1 for k in epl[:args.ep]))   # frame start of ep
         K = int(epl[args.ep])
         nfr_ep = ar * K + 1
-        Ltot = min(nfr_ep, args.max_latents)                    # frames == latent steps
-        frames_np = d["frames"][f0:f0 + Ltot]                   # (Ltot,H,W,3) uint8
+        nsub = (nfr_ep - 1) // st + 1                           # subsampled steps available
+        Ltot = min(nsub, args.max_latents)                      # subsampled steps == latent steps
+        fidx = f0 + np.arange(Ltot) * st                        # raw frame indices of subsampled steps
+        frames_np = d["frames"][fidx]                           # (Ltot,H,W,3) uint8
         gt_frames_in = torch.from_numpy(frames_np.astype(np.float32) / 255.0).permute(0, 3, 1, 2)
         gt_lat = codec.encode_frames(gt_frames_in).cpu()        # (Ltot,192,8,8)
-        actions = np.array([d["actions"][(i - 1) // ar] for i in range(1, Ltot)], np.int64)
+        # action for subsampled step q (1..Ltot-1): episode action (q*st-1)//ar
+        actions = np.array([d["actions"][(q * st - 1) // ar] for q in range(1, Ltot)], np.int64)
     else:
         lat_all = torch.load(os.path.join(args.root, "latents", f"{args.variant}__{args.split}.pt"),
                              map_location="cpu")
