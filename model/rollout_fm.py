@@ -16,6 +16,7 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from models.causal_dit import CausalDiT, block_ar_generate
 from models.vae import WanVAEWrapper
+from action_space import remap_to_compact, NUM_ACTIONS_COMPACT
 
 ALABEL = {1: "L", 2: "L+U", 4: "STAY", 5: "UP", 7: "R", 8: "R+U"}
 
@@ -39,13 +40,20 @@ def main():
     os.makedirs(args.out, exist_ok=True)
     dev = args.device
 
-    # hand-crafted action sequence (length n_actions): 右 / 右上 / 上 交替
+    # hand-crafted action sequence (length n_actions), in RAW Procgen ids: 右/右上/上
     base = ([7] * 6 + [8] * 6 + [5] * 4 + [7] * 4 + [8] * 4 + [5] * 4 + [7] * 4)
     ACTIONS = (base * ((args.n_actions // len(base)) + 1))[:args.n_actions]
+    ACTIONS_RAW = list(ACTIONS)          # keep raw ids for human-readable labels
     print(f"action seq (len {len(ACTIONS)})", flush=True)
 
     ck = torch.load(args.ckpt, map_location=dev)
     cargs = ck.get("args", {})
+    # match the training-time action encoding stored in the ckpt
+    compact = bool(cargs.get("action_compact", False))
+    if compact:
+        args.num_actions = NUM_ACTIONS_COMPACT
+        ACTIONS = remap_to_compact(torch.as_tensor(ACTIONS, dtype=torch.long)).tolist()
+        print(f"  [compact] remapped actions to dense [0..{NUM_ACTIONS_COMPACT-1}]", flush=True)
     z, h = 16, 8
     code_bank = torch.load(os.path.join(args.root, "code_embeds.pt"), map_location="cpu")
     code_dim = next(iter(code_bank.values())).shape[1]
@@ -80,7 +88,7 @@ def main():
     import cv2
     # annotated grid (one tile per latent step, sampled every 4 frames + init)
     s = 4; H = W = 64 * s; per_row = 8
-    labels = ["init"] + [ALABEL.get(a, str(a)) for a in ACTIONS]
+    labels = ["init"] + [ALABEL.get(a, str(a)) for a in ACTIONS_RAW]
     tiles = []
     for li in range(gen.shape[0]):
         fi = 0 if li == 0 else 4 * (li - 1) + 1                 # representative frame of latent li
