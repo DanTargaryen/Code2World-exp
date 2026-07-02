@@ -197,6 +197,8 @@ workspace/Code2world/
 - 默认中文、简明扼要。除非明确要求不输出 HTML 正文(报告类用 `docs/` 下 notebook 模板)。
 - 训练在 K8s pod 内跑,非这台跳板机;后台长任务用 `python -u … > xxx.log 2>&1 &` 落盘日志。
 - 访问 GitHub/HuggingFace 等先设代理 `export http_proxy=http://192.168.48.17:18000`(https 同)。
+- **实验默认 10k steps**(观察:后半程 eval loss 躺平、边际极低;糊是方法上限、加步数救不了)。筛选阶段一律 `--steps 10000 --eval_every 500` 快速判优劣;某方案确认最优、要出定稿模型时再跑满 20k。
+- **新试验开新 git 分支**开发(`git checkout -b exp/xxx`),主线 `main` 只留已验证的 baseline;产物(outputs/日志/*.pt/*.mp4/*.png)已 gitignore。
 
 ## 9. K8s pod 操作流程(实测可用)
 
