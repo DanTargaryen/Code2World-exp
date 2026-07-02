@@ -1,234 +1,137 @@
-# Code2world — Code-Conditioned Causal DiT 世界模型
+# Code2world — Code-Conditioned **Bidirectional** DiT 世界模型
 
-> 神经游戏引擎原型:让模型**读懂游戏规则的可执行源码 + 接收玩家动作 → 自回归预测下一帧画面**,
-> 并验证「改源码 → 生成跟着变」(code sensitivity / 反事实)。核心主张:*code grounds rules*。
+> **本文件是 `exp/action-bidir` 分支的独立说明**(与 `main` 的 block-AR 版不同,勿混用)。
+> 神经游戏引擎原型:模型**读懂游戏规则的可执行源码 + 接收玩家动作 → 生成整段画面**,
+> 验证「改源码 → 生成跟着变」(code sensitivity / 反事实)。核心主张:*code grounds rules*。
+
+## 0. 本分支定位(与 main 的根本差异)
+
+`main` 是 **block-AR + 加性 bias action** 的因果自回归版。本分支 `exp/action-bidir`
+是**彻底纯化**的另一条路线,照搬 **Matrix-Game-3** 的 action 注入 + **全局双向(非因果)** 架构:
+
+| | `main`(block-AR) | `exp/action-bidir`(本分支) |
+|---|---|---|
+| 时间注意力 | block-causal(块内双向、块间因果) | **全双向(非因果)** |
+| action 注入 | 每层 `Linear(9→512)` 加性 bias、只看当前帧 | **窗口 cross-attn**(Matrix-Game 式) |
+| 生成方式 | `block_ar_generate` 一块块自回归、**可任意长** | `full_seq_generate` 整段一次去噪、**定长** |
+| one-hot 维度 | 9(0/3/6 恒零) | **6**(紧凑,只留有效动作) |
+| 代码风格 | 多开关兼容 | **无开关,单一路径** |
+
+**取舍**:bidir 放弃了任意长 rollout(定长 = 训练窗口),换取更贴 Matrix-Game 的整段联合建模。
 
 ## 1. 目标
 
-基于 Procgen **CoinRun**(64×64),用 **Wan 2.1 VAE + Causal DiT + Qwen2.5-0.5B 源码编码** 训练
-teacher-forcing 的自回归视频世界模型。三个核心验证指标:
+基于 Procgen **CoinRun**(64×64),用 **Wan 2.1 VAE + Bidir DiT + Qwen2.5-0.5B 源码编码**
+训练 flow-matching 世界模型。三个核心验证指标:
 
 - **Action following**:给定 action,生成帧是否反映对应动作
 - **Code sensitivity**(最核心命题):改规则源码后,预测帧是否跟着变(反事实)
-- **Rollout stability**:自回归生成 50+ 步后画面是否仍合理
+- **画质/时序一致**:整段生成是否锐利、动作连贯(bidir 无长程 AR 漂移,但受定长约束)
 
-## 2. 架构
-
-```
-CoinRun 64×64 ──Wan2.1 VAE encode(8×)──> 8×8×16 latent ─┐
-coinrun.cpp ──Qwen2.5-0.5B(冻结)──> code tokens ─cross-attn─┤
-action(0~8) ──per-layer Linear──> additive bias ──────────┤
-                                                           ↓
-                                          Causal DiT(12层,63.6M) → 预测下一帧 latent
-                                          (帧内 full attn + 帧间 causal attn)
-                                                           ↓
-                                          Wan2.1 VAE decode → 64×64 frame
-```
-
-三路输入都投到 **embed_dim=512**:VAE latent(16→512) 做 token、action(9→512) 做每层独立 bias、
-code(896→512) 做 cross-attn 的 K/V。**VAE 与 Qwen 全程冻结、离线预编码**,只训 DiT + 三个投影层。
-
-- **Loss** = MSE(latent) + 0.1·CE(reward, 3类) + 0.1·CE(done, 2类),teacher forcing。
-- **模型**:embed 512 / 12 层 / 8 head / spatial 8×8=64 token / window 32 帧 / 63.6M 全可训练。
-
-## 3. 数据集 `code2world_act6`(7 变体配对版)
-
-路径:`/mnt/pfs/data/huangzehuan/datasets/code2world_act6/`
-
-单游戏 CoinRun,围绕 3 个物理参数做 **7 个固定档位单变量变体**(便于 code sensitivity 对比):
-
-| 变体 | 改动参数 | 默认→变体 | 视觉效果 |
-|------|---------|----------|---------|
-| base | —（默认） | — | 基准 |
-| fast / slow | maxspeed | 0.5→0.9 / 0.5→0.25 | 水平更快 / 更慢 |
-| lowgrav / highgrav | gravity | 0.2→0.1 / 0.2→0.35 | 下落飘 / 下落沉 |
-| highjump / lowjump | max_jump | 1.5→2.5 / 1.5→0.9 | 跳更高 / 更矮 |
-
-- **Code condition**:每变体存完整 `source.cpp`,改动行加 `// [VARIANT] changed from <old> (<说明>)` 注释让 Qwen 注意到那几个数字(变体间 99% 源码相同)。Qwen 编码后存 `code_embeds.pt`,训练查表。
-- **VAE latent** 离线预编码存 fp16(`latents/`),训练不跑 VAE。
-- **训练集** = 非配对(各变体随机 seed+随机动作)+ 部分配对;**评估集** = 全配对 held-out seed。
-  配对样本 = 同关卡 seed + 同动作序列跑全 7 变体,是 code sensitivity 最干净的对照
-  (Procgen 在 seed+动作固定时确定性)。
-- **动作采样范围**("act6" 之名即 6 个有效动作):采集时**剔除 vy=-1 的向下动作**(id 0/3/6,平台游戏无意义),
-  只保留 **6 个**——`1=左 2=左+跳 4=停 5=跳 7=右 8=右+跳`(映射 `vx=a/3-1, vy=a%3-1`,见 `set_action_xy`)。
-  模型侧 `num_actions=9` 仍做 9 维 one-hot(0/3/6 维恒为 0)。7 变体全只含这 6 个值、分布均匀。
-- 规模:~2.13M 帧 / latent 4.4GB / window=32 → 训练 ~16855 窗口、评估 ~696 窗口。
-
-## 4. 当前进度(2026-07-01)
-
-- ✅ **Stage 2 完成 — Flow + 时间压缩 + Block-AR 训练跑通(数据集 `code2world_act6_tc`)**:
-  - 20000 steps @ pod `hzh-easygo-1n-2-master-0`(`pytorch` 容器,1×A800),1.21 it/s、~4.6h。
-  - 最终 **train fm 0.148 / eval fm 0.138~0.142**,eval 全程单调降(0.359→0.138)且 **eval≤train,零过拟合**。
-    ⚠️ fm loss 与旧 MSE 版(0.02 量级)**不可直接比**:目标是 velocity `z₁−ε`,方差≈2,量纲不同;0.14 约解释掉 ~93% velocity 方差。
-  - 配置:window 41(→42 latent=14 block×3)/ block_size 3 / batch 8 / bf16。产物 `checkpoints/code2world_act6_tc_fm/ckpt_final.pt`,日志 `model/train_fm_tc.log`。
-  - **噪声实现**:per-chunk 独立 —— block 内 3 帧共享同一 τ(σ)、block 间独立采;init 恒 τ=1;**ε 仍逐 latent 独立**(共享 ε 会制造帧间伪相关泄漏)。匹配"整块联合去噪"的推理。
-- ✅ **完整 10s 自回归 rollout 验证**(`rollout_fm.py`,41 步→42 latent→`decode_video` 165 帧→16fps→10.3s):
-  - 从 init 真·AR 生成(block-AR:历史块 τ=1、当前块从噪声 Euler 16 步积分)。
-  - 现象:**前 ~15 步结构成立;后期(24~41 步)语义漂移(地面收窄、偏蓝灰、角色淡化)但全程保持锐利**。
-  - **关键结论**:flow 解决了"糊" —— AR 到 41 步画面仍锐利清晰,**不再**出现旧 MSE 版"~20 步坍塌成渐变色块"。
-    问题从「画面糊」变成「长程内容漂移」(误差累积表现为语义偏离而非模糊),更本质、也更好办 → 下一步 scheduled sampling(见 `future_plan.md §1.4`)。
-  - 产物:`model/outputs/custom_rollout_fm/base_blockar.mp4` + `_grid.png`。
-
-### 实验分支:pixel-space(路径 C,2026-07-01,与 latent 版并行对比)
-
-验证「去掉 Wan VAE、直接 pixel-space 生成是否更锐/artifact 更少」。核心技巧:**8×8 pixel patch 当一个 token**
-→ 每 token=8·8·3=192 维原始像素、grid 8×8=64 token/帧,**几何与 latent 版完全一致**,`CausalDiT` 零架构改动
-(仅 `latent_dim=192, spatial_size=8`)。VAE 换成无参数 patchify/unpatchify(纯 reshape,无损)。
-
-- **路径 C = 每帧建模、不做时间压缩**:window=41 帧(+init=42 latent step=14 block×3)=2.6s@16fps,快速验锐度。
-- 新文件:`models/pixel_codec.py`(patchify + [0,1]→[-1,1] 归一化)、`dataset/pixel_dataset.py`(直接读 npz `frames`,
-  per-frame 动作映射 `(i-1)//action_repeat`,无需重采/预编码)、`train_fm_pixel.py`(复用 `train_fm` 的 loss/τ/state)、
-  `rollout_compare.py --pixel`。loss/per-block τ/forward_state 逻辑与 latent 版一致,唯一变量=「16维学习latent vs 192维原始像素」。
-- ⚠️ **归一化坑(已解决)**:最初用 per-channel 单位方差归一化,遇 CoinRun「多暗+少量亮」重尾分布产生大 outlier
-  (亮像素→+7),fm loss 飙到 ~20。改用标准 **[0,1]→[-1,1]**(mean/std=0.5)后 fm 起点回到 ~1.3(与 latent 版同量级)。
-- 显存实测:8×8 patch batch8 ~0.9 it/s、峰值 45GB(可跑);4×4 patch(256 token/帧)batch4 即 OOM,路径 C 不用。
-- **训练中**:GPU2,20k steps,产物 `checkpoints/code2world_act6_tc_pixel/`,日志 `model/train_pixel.log`。
-  跑完用 `rollout_compare.py --pixel` 同 ep 对比 latent 版,判断 pixel 是否更优;结论待定。
-
-### 历史进度(Stage 1 / act6,已被 Stage 2 取代)
-
-- ✅ **Stage 1(PoC,数据集 `code2world`)**:20K steps 跑通端到端,eval loss 0.0040,**无过拟合**
-  (eval<train),能生成连贯但**偏糊**的视频。结论:code→action→video 的 AR 闭环成立。
-  - 糊的主因:① MSE 回归均值 ② 自回归误差累积(预期现象,非 bug)。
-  - checkpoint:`checkpoints/code2world/`(ckpt_final.pt 等)。
-- ✅ **`code2world_act6` 训练完成**(7 变体配对版,为 Stage 3 准备):
-  - 20000 steps,在 K8s pod `hzh-easygo-1n-2-master-0`(container `pytorch`)训练,~3.57 it/s、~1.9h。
-  - 最终 train loss **0.00460**、eval loss **0.00422**(latent 主导,reward/done≈0),eval<train 无过拟合。
-  - 配置:window 32 / batch 8 / num_actions 9 / bf16 / cuda:0。
-  - 产物:`checkpoints/code2world_act6/ckpt_final.pt`,日志 `model/train_act6.log`。
-- ✅ **自回归 rollout 验证**(`model/rollout_custom.py`,自定义"右/右上/上"动作序列):
-  - 推理是**真 AR**(把自己预测的 latent 拼回历史当输入),动作**逐帧、每层独立 bias** 注入。
-  - 现象:**前 ~8 步动作跟手、结构成立;~10 步后漂移、~20 步后场景坍塌成渐变色块**。
-    完全符合"MSE 均值化 + AR 误差累积"的预期 → 直接动机:上 flow matching。
-  - 产物:`model/outputs/custom_rollout/`(帧网格 PNG + mp4)。
-- ⏳ **进行中(下一步,见 `docs/future_plan.md`)**:① loss 改 flow matching;② VAE 时间压缩重采数据(下文)。
-
-### 改造已落地(2026-07-01,代码完成待训练验证)
-
-目标:**生成 ~10s @16fps 视频**,用 Wan2.1 VAE 做时间+空间压缩,**block-AR(每步生成 3 个 latent)+ flow matching**。
-
-**时间账(钉死的)**:10s×16fps=160→录 **165 帧**(=4×41+1)→Wan 时间 4× → **42 latent**(=14 block×3,÷3 满足)。
-1 action↔1 latent↔4 帧;**latent 0 是 init**(首帧单独编码,恒给定,不预测),block 0={init, x₁, x₂}。
-
-1. **Block-AR 单流 flow** —— `models/causal_dit.py`(已整体重写):
-   - **temporal attention 改 block-causal**:`block(j)≤block(i)`(块内双向、块间 causal),`block_size=1` 退化成原 causal。
-   - **backbone 即去噪器**(单流 Diffusion Forcing,非两流):`forward_flow(z_τ,τ,action,code)→逐 latent velocity`。
-     **每个 latent 独立 τ、init 恒 τ=1**;块内邻居只以**带噪**形态互看 → 天然无泄漏(这是选单流而非两流的原因:init 混在 block 0 里也不漏)。
-   - τ 经 sinusoidal→MLP→**逐 latent 加性 bias**(`tau_proj` zero-init,初始≈旧行为);`flow_out` zero-init 稳起步。
-   - **state 解耦**:`forward_state(clean,…)→reward/done`,单独 clean 前向、τ-free。
-   - `forward()`(旧 MSE 路径)保留,旧 ckpt 用 `strict=False` 可加载(rollout*.py 已改)。
-   - **action 对齐**:latent i(i≥1)由 a_{i-1} 产生,序列 pos0 给 null action。
-   - `block_ar_generate()`:推理时历史块 τ=1(clean)、当前块从噪声 Euler 积分联合去噪;block 0 出 2 个、之后每块 3 个,41 动作→42 latent。
-2. **训练 `train_fm.py`**(整体重写,不动 `train.py`):整窗 L=42 latent,逐 latent τ~U(0,1)(init=1),
-   `L_fm=‖v-(z₁-ε)‖²`(排除 init);reward/done CE 挂 `forward_state` 的 clean 输出。sample dump=block-AR 生成 vs GT(`decode_video`)。
-   关键参数:`--window 41`(→42 latent)、`--block_size 3`。
-3. **推理 `rollout_fm.py`**(重写):`block_ar_generate`+`decode_video`(1 latent→4 帧)+**16fps 导出**,41 步→165 帧≈10s。
-4. **VAE 时间压缩**(`vae.py`):`encode_video`(4K+1 帧→K+1 latent 整段)/`decode_video`(逆)。
-5. **数据集 `code2world_act6_tc`**(新目录):`collect_one.py --action-repeat 4 --max-steps 60`
-   (录全 4K+1 帧、reward 窗口求和、done OR、跨 reset 丢弃);`precompute.py` 按 `action_repeat` 自动走 temporal 模式逐 episode `encode_video`,
-   flat 后每 ep 仍 K+1 latent → `dataset.py` 零改动(window=41 取 42-latent 窗口,block 网格在窗口局部下标上、采样偏移无关)。
-
-> 自检通过:block-causal mask 正确、forward_flow/forward_state/block_ar_generate shape 对、训练步+反传 OK、41 动作→42 latent。
-> 下一步(K8s pod):① `build_dataset.py`(默认 out=`code2world_act6_tc`)→ `precompute.py`;② `train_fm.py --window 41 --block_size 3`;③ `rollout_fm.py` 看 10s 锐度。
-
-### 已确认的关键事实(供改造用)
-
-- **Wan VAE 是 causal 3D VAE,时间压缩规律 `T 帧 → 1+(T-1)/4 个 latent`**(实测:1→1,5→2,9→3,128→32;
-  decode 反之 `L → 1+(L-1)·4`)。即首帧单独成 1 latent,之后每 4 帧压成 1 latent。
-- 当前 `models/vae.py` 仍是**逐帧编码**(T=1 chunk,只用空间 8×、未用时间压缩);改造需按 episode 整段编码。
-
-## 5. 后续规划
-
-详见 `docs/future_plan.md`(以 flow matching velocity 为主线)。当前正在推进两件**耦合**改动:
-
-1. **Loss 改 flow matching**:latent 预测从 MSE 回归均值 → **rectified flow 预测 velocity**
-   `v*=z₁−ε`(建模分布而非均值,解决糊);per-frame 独立噪声(Diffusion Forcing),τ 经 AdaLN-Zero 注入;
-   reward/done state head 仍挂 clean condition(与 τ/噪声解耦)。
-2. **VAE 时间压缩重采数据**:`action_repeat=4`(每动作持续 4 env steps)→ `4K+1 帧` 经 Wan VAE 时间压缩
-   → `K+1 个 latent`,**一个 action ↔ 一个 latent ↔ 4 帧**。序列短 4×、长程误差累积少 4×。
-   - 改造面:`collect_one.py`(action repeat + reward 聚合 sum / done 聚合 any)、
-     `vae.py`(逐帧→整段时间压缩)、`precompute.py`/`dataset.py`(latent 时间维=action 数)、
-     `causal_dit.py`(时序维换成 latent step,模型结构基本不动)。
-   - 新数据集独立目录(不覆盖 `code2world_act6`)。
-
-后续(数据/loss 改造跑通后):
-
-- **Stage 3 — Code sensitivity 量化**(核心科学问题,数据已就绪):同 held-out seed + 同动作喂不同变体源码,
-  测生成轨迹是否随 code 改变方向正确;对照:code 置零/打乱看预测是否退化。已有 `eval_code_sensitivity.py` / `visualize_sensitivity.py`。
-- **Stage 4 — 鲁棒性/扩展**:long-horizon rollout、window 加长、DDP 多卡、跨游戏、连续参数采样。
-- **演进**:Transfusion-lite 统一序列(同 backbone 同时出 state 与 velocity,互为条件),见 `future_plan.md` §3。
-
-## 6. 目录结构
+## 2. 架构(`models/bidir_dit.py`,`BidirDiT`,78.5M)
 
 ```
-workspace/Code2world/
-├── CLAUDE.md              # 本文件
-├── data_gen/              # Stage 1 数据生成(three.js + playwright,确定性引擎)
-│   ├── generate.mjs       # 批量采集 CLI;recorder.mjs / rng.js(mulberry32)/ verify.mjs
-│   └── games/coin_collection.js
-├── model/                 # 训练 + 模型 + 评估
-│   ├── train.py           # teacher-forcing 训练(act6 用 train_act6.log)
-│   ├── dataset/           # collect_one.py(采集,含 ACTION_SET=6动作)/ precompute.py(VAE+Qwen 预编码)
-│   │   ├── build_dataset.py / variants.py / dataset.py
-│   ├── models/            # causal_dit.py / vae.py(Wan VAE wrapper,当前逐帧)
-│   ├── rollout.py / rollout_custom.py   # AR 推理(后者支持自定义动作序列)
-│   ├── eval_code_sensitivity.py / visualize_sensitivity.py
-│   ├── outputs/           # 推理产物(custom_rollout/ 等)
-│   └── *.log              # train_act6.log / train_run.log 等
-└── docs/                  # 设计文档与报告(html notebook,localhost:8000/docs/ 查看)
-    ├── future_plan.md           # Stage2+ 改造计划(flow matching 主线 + state + Transfusion-lite)
-    ├── model_plan.md/.html      # 训练计划全文
-    ├── dataset_spec.html        # 数据集设计规格(变体/配对/动作采样)
-    ├── training_pipeline.html   # 训练 pipeline 逐步详解
-    ├── stage1_summary.html      # 第一阶段训练总结(曲线/指标/糊根因/规划)
-    ├── todo.html                # 对照博客 6 阶段路线图的进度
-    └── viz.html                 # 数据可视化
+CoinRun 64×64 ──Wan2.1 VAE encode(8×space+4×time)──> latent 序列 ─┐
+coinrun.cpp ──Qwen2.5-0.5B(冻结)──> code tokens ─cross-attn──────┤
+action(6维one-hot,窗口) ──window cross-attn──────────────────────┤
+                                                                 ↓
+                                    Bidir DiT(12层,全双向) → 整段 velocity
+                                                                 ↓
+                                    full_seq_generate(整段Euler去噪)→ Wan VAE decode
 ```
+
+- 序列 = **L 个 latent**(默认 42 = window 41 + init),每 latent **S=8×8=64 token**,宽 **D=512**。
+- **1 latent ↔ 1 action ↔ 4 帧**(Wan VAE 时间压缩已离线做好);latent 0 是 **init**(编码首帧,恒 clean、不预测)。
+- VAE 与 Qwen **全程冻结、离线预编码**,只训 DiT。
+
+**DiTBlock 固定顺序**(无分支):
+```
+1. tau bias        (timestep embedding → per-latent 加性 bias, zero-init)
+2. spatial self-attn   (帧内 64 token 全注意)
+3. temporal self-attn  (跨 L latent 全双向, 按 spatial 位)
+4. cross-attn to code  (visual=Q, code=K/V)
+5. action window cross-attn  (Matrix-Game 位置: cross-attn 后、FFN 前)
+6. FFN
+```
+
+**action window cross-attn**(`ActionWindowCrossAttention`,对齐 Matrix-Game 细节):
+- 动作 embed `Linear(6→128)+SiLU+Linear`,在 **latent 粒度**滑窗 concat `W`(默认3)个
+  (当前+前 W-1),做 per-latent K/V;visual token 做 Q,沿时间轴双向 attend。
+- **QK 用 RMSNorm**;q/k 带 **1D RoPE**(时间轴,theta=256);左 pad **重复首帧动作**(非补零)。
+- **适配点**:Code2world 已离线时间压缩,滑窗按 latent(不像 Matrix-Game 乘 vae_ratio×4)。
+- proj **zero-init** → 未训练时该子层恒等,起步稳。
+
+**训练目标**(`train_fm.py`,单流 flow matching):
+- **整段统一 τ**:每样本所有非-init latent 共享一个 `τ~U(0,1)`(匹配整段同步去噪),init 恒 τ=1、排除出 loss。
+- `z_τ=(1-τ)ε+τ·z1`,`v=forward_flow(...)`,`L_fm=‖v-(z1-ε)‖²`(latents 1..L-1)。
+- reward/done 走 `forward_state` clean 前向,`L = L_fm + 0.1·CE(reward) + 0.1·CE(done)`。
+
+**推理**(`full_seq_generate`):init 恒 clean,其余从纯噪声,整段 **Euler 16 步**联合积分。定长 = len(actions)+1。
+
+## 3. Action 空间(`action_space.py`)
+
+- Procgen CoinRun 完整 15 维,有效 0~8(9维),采集只留 **6 个**动作(剔除向下 0/3/6):
+  `1=左 2=左跳 4=停 5=跳 7=右 8=右跳`。
+- 数据集存**原始 Procgen id**;模型边界 `remap_to_compact` 映射到紧凑 `[0..5]`,**6 维 one-hot**(无死维)。
+- 本分支恒用 compact(非开关)。
+
+## 4. 数据集 `code2world_act6_tc`(复用,未改)
+
+路径:`/mnt/pfs/data/huangzehuan/datasets/code2world_act6_tc/`。7 变体配对版,
+`action_repeat=4`(4K+1 帧 → Wan 时间压缩 → K+1 latent),window=41→42 latent。
+详见 `main` 分支说明与 `dataset/`。**本分支只改模型/训练,数据集零改动**。
+
+## 5. 当前进度(2026-07-02)
+
+- ✅ **架构改造代码完成,本地自检全过,未训练**。分支 commit 链(从 main 起):
+  - `47e6904` action_compact:one-hot 9→6
+  - `0db8f8c`/`8ae8880`/`f001a2c` 逐步加 window cross-attn → 对齐 Matrix-Game 注入位置 → 补 RoPE/RMSNorm/首帧pad
+  - `ed7f5a8` 加 bidir(非因果)架构
+  - `317be31` **纯化**:删所有开关与 9 个 legacy 文件,`causal_dit.py`→`bidir_dit.py`,`CausalDiT`→`BidirDiT`
+- 自检覆盖:syntax、fwd/bwd、zero-init 恒等、**双向性**(改 idx4 动作影响到过去 idx1,与因果相反)、
+  `full_seq_generate`(init 保留/定长)、`compute_loss` 端到端。全尺寸 **78.5M** 参数。
+- ⏳ **待办**:上 pod 训练验证(`--window 41 --batch_size 8 --steps 10000 --eval_every 500`),
+  对比 bidir 画质 vs main 的 block-AR;若优则跑满 20k 出定稿。
+
+## 6. 目录结构(本分支已精简)
+
+```
+model/
+├── models/  bidir_dit.py (BidirDiT + full_seq_generate)  vae.py (Wan VAE, 冻结)
+├── train_fm.py      # bidir flow 训练(无开关)
+├── rollout_fm.py    # 整段生成 → decode → mp4+grid
+├── action_space.py  # ACTION_SET / remap_to_compact (6维)
+├── render_gt.py
+└── dataset/  build_dataset collect_one dataset precompute variants
+```
+> 已删(纯化):MSE 版 train.py/rollout.py/train_overfit.py/rollout_custom.py、
+> pixel 版 train_fm_pixel/pixel_codec/pixel_dataset/rollout_compare、旧 eval/visualize_sensitivity。
+> (这些在 `main` 及其他分支仍在,需要时回那边取。)
 
 ## 7. 关键参考
 
-- **IRIS**(github.com/eloialonso/iris):VQ-VAE + AR Transformer,参考序列构建与 loss。
-- **ReactiveGWM**(arxiv 2605.15256):Wan 底座 + action additive bias + cross-attn,复用 action/code 注入设计。
-- **Wan 2.1**(github.com/Wan-Video/Wan2.1):3D Causal VAE(8× spatial,16ch)+ DiT。用 2.1 而非 2.2
-  (2.2 压缩 16×/32×,64×64 帧只剩 4×4 或 2×2,信息损失大)。
+- **Matrix-Game-3**(`workspace/Matrix-Game/Matrix-Game-3`,`wan/modules/action_module.py`):
+  本分支 action 注入的直接蓝本(keyboard 分支:窗口动作做 K/V、img 做 Q、RoPE+RMSNorm)。
+- **Wan 2.1**:3D Causal VAE(8× 空间,16ch,4× 时间)+ DiT。
+- **ReactiveGWM**(arxiv 2605.15256):Wan 底座 + action 注入 + cross-attn。
 
 ## 8. 协作约定
 
-- 默认中文、简明扼要。除非明确要求不输出 HTML 正文(报告类用 `docs/` 下 notebook 模板)。
-- 训练在 K8s pod 内跑,非这台跳板机;后台长任务用 `python -u … > xxx.log 2>&1 &` 落盘日志。
-- 访问 GitHub/HuggingFace 等先设代理 `export http_proxy=http://192.168.48.17:18000`(https 同)。
+- 默认中文、简明。训练在 K8s pod(非跳板机),`/mnt/pfs` 共享盘落日志/ckpt。
+- 进 pod:`kubectl exec hzh-easygo-1n-2-master-0 -c pytorch -- bash -lc '<cmd>'`;
+  后台长任务 `cd model && CUDA_VISIBLE_DEVICES=0 nohup python -u ... > xxx.log 2>&1 &`。
+- **筛选阶段 10k steps**(后半 eval 躺平、边际低);确认最优再跑满 20k。
+- 访问 GitHub/HF 先设代理 `export http_proxy=http://192.168.48.17:18000`(https 同)。
 
-## 9. K8s pod 操作流程(实测可用)
+### 训练/推理命令(本分支)
 
-**这台是跳板机、不能跑训练**(装不下 14B VAE)。计算全在 pod 里,`/mnt/pfs` 是**跳板机与 pod 共享盘**
-(日志/数据/ckpt 落这里,跳板机可直接 `tail`/`ls`,无需再 exec)。
+```bash
+# 训练(整段 bidir flow, 6维动作恒 compact)
+CUDA_VISIBLE_DEVICES=0 python -u train_fm.py \
+  --root /mnt/pfs/data/huangzehuan/datasets/code2world_act6_tc \
+  --window 41 --batch_size 8 --steps 10000 --eval_every 500 \
+  --action_window 3 --out <ckpt_dir> > train_bidir.log 2>&1 &
 
-- **进 pod**(非交互式,别用 `-it`):`kubectl get pods` 看列表;GPU pod 是 `hzh-easygo-1n-2-master-0`,
-  容器 `-c pytorch`(8×A800-80GB)。跑命令:
-  ```bash
-  kubectl exec hzh-easygo-1n-2-master-0 -c pytorch -- bash -lc '<命令>'
-  ```
-- **起后台长任务**(训练/预编码):在 pod 里 `cd model && CUDA_VISIBLE_DEVICES=0 nohup python -u … > xxx.log 2>&1 &`;
-  日志在共享盘,跳板机 `tail -f .../model/xxx.log` 直接看;进度/存活用 `kubectl exec … nvidia-smi` + `ps aux|grep`。
-  ⚠️ 跳板机 bash 工具默认 120s 超时,`sleep` 别超 110s(否则 exit 143 被杀),长等要显式设 timeout。
-- **一次性小验证**用 heredoc:`kubectl exec … -- bash -lc 'python - <<"PY" … PY'`;GPU 选空闲卡
-  (`nvidia-smi` 看,GPU1 常被占,验证用 `CUDA_VISIBLE_DEVICES=2`)。
-
-### `code2world_act6_tc` 数据集重建流程(2026-07-01 实测)
-
-1. **采集**(procgen 逐变体重建源码,~1.5min/变体,×7≈11min):
-   `python -u dataset/build_dataset.py --action-repeat 4`(默认 out=`…/datasets/code2world_act6_tc`,`--max-steps 60`)。
-   跑完自动还原 `coinrun.cpp`、写 `variants.json`。
-2. **预编码**(`--only latents` 跳过已存的 code_embeds;temporal VAE **批量** encode ~5min):
-   `CUDA_VISIBLE_DEVICES=0 python -u dataset/precompute.py --root …/code2world_act6_tc --only latents`。
-   - 关键提速:`encode_frames_temporal` 按 `ep_batch=16` 分组、右 pad 到批内最长帧、单次 VAE 前向后按各自 K+1 切回。
-     **Wan VAE 时间上 causal**(实测尾部 pad 帧对前面 latent 零影响,exact 0.0),故 pad-batch 安全、比逐 episode 快 ~10×。
-3. **训练**(block-AR flow,67.3M 参数,~1.2 it/s ≈ 4.7h/20k):
-   ```bash
-   CUDA_VISIBLE_DEVICES=0 python -u train_fm.py --root …/code2world_act6_tc \
-     --window 41 --block_size 3 --batch_size 8 --steps 20000 \
-     --out …/checkpoints/code2world_act6_tc_fm > train_fm_tc.log 2>&1 &
-   ```
-   实测:train 10352 窗口 / eval 431;step200 时 fm 0.75、reward/done 已收敛。
-4. **推理**:`python -u rollout_fm.py --root …/code2world_act6_tc --ckpt …/code2world_act6_tc_fm/ckpt_final.pt`
-   → block-AR 生成 42 latent、`decode_video` 出 165 帧、16fps mp4(≈10.3s)。
+# 推理(整段生成 42 latent → 165 帧 → 16fps ≈10s)
+python -u rollout_fm.py --root <same_root> --ckpt <ckpt_dir>/ckpt_final.pt --flow_steps 16
+```
