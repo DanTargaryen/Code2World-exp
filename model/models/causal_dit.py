@@ -276,14 +276,17 @@ class DiTBlock(nn.Module):
 class CausalDiT(nn.Module):
     def __init__(self, latent_dim=16, embed_dim=512, num_layers=12, num_heads=8,
                  num_actions=15, spatial_size=8, max_frames=64, code_dim=896,
-                 block_size=3, action_mode="bias", action_window=3):
+                 block_size=3, action_mode="bias", action_window=3,
+                 attn_mode="block_causal"):
         super().__init__()
+        assert attn_mode in ("block_causal", "bidir")
         self.spatial_size = spatial_size
         S = spatial_size * spatial_size
         self.S = S
         self.embed_dim = embed_dim
         self.latent_dim = latent_dim
         self.block_size = block_size
+        self.attn_mode = attn_mode
         self.action_mode = action_mode
         self.action_window = action_window
 
@@ -324,7 +327,10 @@ class CausalDiT(nn.Module):
         x = latents.permute(0, 1, 3, 4, 2).reshape(B, L, S, C)  # (B,L,S,C)
         x = self.input_proj(x)                                  # (B,L,S,D)
         x = x + self.spatial_pos + self.temporal_pos[:, :L]
-        allow = block_causal_allow(L, block_size, x.device)     # (L,L) bool
+        if self.attn_mode == "bidir":
+            allow = torch.ones(L, L, dtype=torch.bool, device=x.device)  # full (non-causal)
+        else:
+            allow = block_causal_allow(L, block_size, x.device)     # (L,L) bool
         for blk in self.blocks:
             x = blk(x, action_onehot, code, allow, code_mask, t_emb)
         return self.ln_out(x)                                   # (B,L,S,D)
@@ -389,3 +395,32 @@ def block_ar_generate(model, init_latent, actions, code, num_actions, dev,
             z_block = z_block + dt * v.float()
         hist = torch.cat([hist, z_block], dim=1)
     return hist                                                   # (1, L_target, C, h, w)
+
+
+@torch.no_grad()
+def full_seq_generate(model, init_latent, actions, code, num_actions, dev,
+                      flow_steps, code_mask=None):
+    """Bidirectional (non-causal) generation: denoise the WHOLE sequence at once.
+
+    With bidirectional attention there is no causal ordering to roll out block by
+    block, so we generate a single fixed-length clip: the init (index 0) is held
+    clean, every other latent starts from noise and is integrated jointly with one
+    shared tau. Length is fixed by len(actions) (= training window), NOT arbitrary.
+
+    init_latent: (1, 1, C, h, w) clean INIT. actions: length-K -> total L = K+1.
+    Returns (1, K+1, C, h, w) including the init.
+    """
+    L = len(actions) + 1
+    Cshape = init_latent.shape[2:]
+    a_full = torch.zeros(1, L, num_actions, device=dev)
+    for i in range(1, L):
+        a_full[0, i, int(actions[i - 1])] = 1.0
+    z = torch.randn(1, L, *Cshape, device=dev)
+    z[:, :1] = init_latent                                         # slot 0 = clean init
+    dt = 1.0 / flow_steps
+    for s in range(flow_steps):
+        tau = torch.full((1, L), s * dt, device=dev)
+        tau[:, 0] = 1.0                                            # init always clean
+        v = model.forward_flow(z, tau, a_full, code, code_mask)
+        z[:, 1:] = z[:, 1:] + dt * v[:, 1:].float()               # integrate non-init only
+    return z                                                      # (1, L, C, h, w)

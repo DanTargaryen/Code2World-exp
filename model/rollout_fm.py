@@ -14,7 +14,7 @@ import numpy as np
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from models.causal_dit import CausalDiT, block_ar_generate
+from models.causal_dit import CausalDiT, block_ar_generate, full_seq_generate
 from models.vae import WanVAEWrapper
 from action_space import remap_to_compact, NUM_ACTIONS_COMPACT
 
@@ -63,7 +63,8 @@ def main():
                       max_frames=cargs.get("window", 41) + 1, code_dim=code_dim,
                       block_size=cargs.get("block_size", args.block_size),
                       action_mode=cargs.get("action_mode", "bias"),
-                      action_window=cargs.get("action_window", 3)).to(dev)
+                      action_window=cargs.get("action_window", 3),
+                      attn_mode=cargs.get("attn_mode", "block_causal")).to(dev)
     model.load_state_dict(ck["model"]); model.eval()
     print(f"loaded {args.ckpt} (step {ck.get('step')})", flush=True)
 
@@ -77,8 +78,19 @@ def main():
     init_latent = lat_all["latents"][l0:l0 + 1].float().unsqueeze(0).to(dev)   # (1,1,z,h,w)
     code = code_bank[args.variant].float().unsqueeze(0).to(dev)
 
-    gen = block_ar_generate(model, init_latent, ACTIONS, code, args.num_actions, dev,
-                            cargs.get("block_size", args.block_size), args.flow_steps)[0]
+    attn_mode = cargs.get("attn_mode", "block_causal")
+    if attn_mode == "bidir":
+        # non-causal: whole sequence denoised jointly, fixed length = len(ACTIONS)+1.
+        # Best kept equal to the training window; longer than that is out of distribution.
+        win = cargs.get("window", 41)
+        if len(ACTIONS) != win:
+            print(f"  [bidir] note: n_actions={len(ACTIONS)} != train window={win}; "
+                  f"bidir is fixed-length, results best at the trained length", flush=True)
+        gen = full_seq_generate(model, init_latent, ACTIONS, code, args.num_actions,
+                                dev, args.flow_steps)[0]
+    else:
+        gen = block_ar_generate(model, init_latent, ACTIONS, code, args.num_actions, dev,
+                                cargs.get("block_size", args.block_size), args.flow_steps)[0]
     frames = vae.decode_video(gen)                              # (4*(L-1)+1, 3, H, W)
     imgs = [(frames[i].permute(1, 2, 0).clamp(0, 1).cpu().numpy() * 255).astype(np.uint8)
             for i in range(frames.shape[0])]
