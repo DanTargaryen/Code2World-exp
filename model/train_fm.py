@@ -150,6 +150,11 @@ def main():
     ap.add_argument("--block_size", type=int, default=3)
     ap.add_argument("--batch_size", type=int, default=8)
     ap.add_argument("--num_actions", type=int, default=9)
+    ap.add_argument("--action_mode", choices=["bias", "crossattn"], default="bias",
+                    help="how actions enter each DiT block: additive bias (baseline) "
+                         "or Matrix-Game-style window cross-attention")
+    ap.add_argument("--action_window", type=int, default=3,
+                    help="crossattn: #latents of action history per token (incl. current)")
     ap.add_argument("--embed_dim", type=int, default=512)
     ap.add_argument("--num_layers", type=int, default=12)
     ap.add_argument("--num_heads", type=int, default=8)
@@ -184,9 +189,12 @@ def main():
     model = CausalDiT(latent_dim=z, embed_dim=args.embed_dim, num_layers=args.num_layers,
                       num_heads=args.num_heads, num_actions=args.num_actions,
                       spatial_size=h, max_frames=L0, code_dim=code_dim,
-                      block_size=args.block_size).to(dev)
+                      block_size=args.block_size, action_mode=args.action_mode,
+                      action_window=args.action_window).to(dev)
     n_params = sum(p.numel() for p in model.parameters()) / 1e6
-    print(f"Model: {n_params:.1f}M params", flush=True)
+    print(f"Model: {n_params:.1f}M params | action_mode={args.action_mode}"
+          f"{f' window={args.action_window}' if args.action_mode=='crossattn' else ''}",
+          flush=True)
 
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scaler = torch.amp.GradScaler("cuda", enabled=amp_dtype is torch.float16)

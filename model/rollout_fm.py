@@ -53,7 +53,9 @@ def main():
                       num_layers=cargs.get("num_layers", 12), num_heads=cargs.get("num_heads", 8),
                       num_actions=args.num_actions, spatial_size=h,
                       max_frames=cargs.get("window", 41) + 1, code_dim=code_dim,
-                      block_size=cargs.get("block_size", args.block_size)).to(dev)
+                      block_size=cargs.get("block_size", args.block_size),
+                      action_mode=cargs.get("action_mode", "bias"),
+                      action_window=cargs.get("action_window", 3)).to(dev)
     model.load_state_dict(ck["model"]); model.eval()
     print(f"loaded {args.ckpt} (step {ck.get('step')})", flush=True)
 

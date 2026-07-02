@@ -125,10 +125,75 @@ class CrossAttention(nn.Module):
         return self.proj(out)
 
 
-class DiTBlock(nn.Module):
-    def __init__(self, dim, num_heads, num_actions, mlp_ratio=4.0):
+class ActionWindowCrossAttention(nn.Module):
+    """Window-conditioned action injection (Matrix-Game style, adapted).
+
+    Matrix-Game gives one action per RAW frame and pulls a window of
+    vae_ratio*windows_size raw frames per latent. Code2world is already
+    time-compressed offline (1 latent <-> 1 action <-> 4 frames), so the window
+    is taken directly in LATENT units: for latent i we gather actions
+    [i-(W-1) .. i] (left-padded with zeros = "no history"), giving each latent
+    the current action plus the previous W-1. That W-latent window equals the
+    3-latent (=12 raw-frame) context Matrix-Game uses at W=3.
+
+    The windowed action features become per-latent K/V; the visual tokens are the
+    query. Attention runs over the temporal axis per spatial position, masked by
+    the SAME block-causal `allow` used by temporal self-attention (Matrix-Game is
+    non-causal; we keep it causal to avoid AR leakage). The output projection is
+    zero-init so an untrained block reduces to the identity (stable start, on par
+    with the additive-bias path).
+    """
+    def __init__(self, dim, num_heads, num_actions, window=3, act_hidden=128):
         super().__init__()
-        self.action_proj = nn.Linear(num_actions, dim, bias=False)
+        self.num_heads = num_heads
+        self.window = window
+        self.act_embed = nn.Sequential(
+            nn.Linear(num_actions, act_hidden, bias=True), nn.SiLU(),
+            nn.Linear(act_hidden, act_hidden, bias=True))
+        self.q = nn.Linear(dim, dim)
+        self.kv = nn.Linear(act_hidden * window, dim * 2)
+        self.q_norm = nn.LayerNorm(dim // num_heads)
+        self.k_norm = nn.LayerNorm(dim // num_heads)
+        self.proj = nn.Linear(dim, dim)
+        nn.init.zeros_(self.proj.weight); nn.init.zeros_(self.proj.bias)
+
+    def forward(self, x, action_onehot, allow):
+        # x: (B,T,S,D)  action_onehot: (B,T,A)  allow: (T,T) bool
+        B, T, S, D = x.shape
+        nh, hd = self.num_heads, D // self.num_heads
+        a = self.act_embed(action_onehot)                       # (B,T,H)
+        W = self.window
+        # left-pad W-1 with zeros, then sliding window concat -> (B,T,H*W)
+        a_pad = F.pad(a, (0, 0, W - 1, 0))                      # (B, T+W-1, H)
+        win = torch.stack([a_pad[:, i:i + T] for i in range(W)], dim=2)  # (B,T,W,H)
+        win = win.reshape(B, T, -1)                            # (B,T,H*W)
+        kv = self.kv(win).reshape(B, T, 2, nh, hd)
+        k, v = kv.unbind(2)                                    # each (B,T,nh,hd)
+        q = self.q(x).reshape(B, T, S, nh, hd)
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+        # attend over time per spatial position: q (B,S,nh,T,hd) x k (B,S,nh,T,hd)
+        q = q.permute(0, 2, 3, 1, 4)                           # (B,S,nh,T,hd)
+        k = k.permute(0, 2, 1, 3).unsqueeze(1).expand(B, S, nh, T, hd)
+        v = v.permute(0, 2, 1, 3).unsqueeze(1).expand(B, S, nh, T, hd)
+        out = F.scaled_dot_product_attention(q, k, v, attn_mask=allow[None, None, None])
+        out = out.permute(0, 3, 1, 2, 4).reshape(B, T, S, D)   # (B,T,S,D)
+        return self.proj(out)
+
+
+class DiTBlock(nn.Module):
+    def __init__(self, dim, num_heads, num_actions, mlp_ratio=4.0,
+                 action_mode="bias", action_window=3):
+        super().__init__()
+        self.action_mode = action_mode
+        if action_mode == "bias":
+            self.action_proj = nn.Linear(num_actions, dim, bias=False)
+        elif action_mode == "crossattn":
+            self.ln_act = nn.LayerNorm(dim)
+            self.action_cross = ActionWindowCrossAttention(
+                dim, num_heads, num_actions, window=action_window)
+        else:
+            raise ValueError(f"unknown action_mode {action_mode}")
         self.tau_proj = nn.Linear(dim, dim)            # injects timestep embedding
         nn.init.zeros_(self.tau_proj.weight); nn.init.zeros_(self.tau_proj.bias)
         self.ln_sp = nn.LayerNorm(dim)
@@ -142,11 +207,16 @@ class DiTBlock(nn.Module):
         self.ff = nn.Sequential(nn.Linear(dim, hidden), nn.GELU(), nn.Linear(hidden, dim))
 
     def forward(self, x, action_onehot, code, allow, code_mask=None, t_emb=None):
-        # action_onehot: (B, T, num_actions) -> bias (B, T, 1, D); t_emb: (B, T, D) or None
-        bias = self.action_proj(action_onehot)
-        if t_emb is not None:
-            bias = bias + self.tau_proj(t_emb)
-        x = x + bias.unsqueeze(2)
+        # action_onehot: (B, T, num_actions); t_emb: (B, T, D) or None
+        if self.action_mode == "bias":
+            bias = self.action_proj(action_onehot)
+            if t_emb is not None:
+                bias = bias + self.tau_proj(t_emb)
+            x = x + bias.unsqueeze(2)
+        else:  # crossattn: window action as K/V, visual tokens as query
+            if t_emb is not None:
+                x = x + self.tau_proj(t_emb).unsqueeze(2)
+            x = x + self.action_cross(self.ln_act(x), action_onehot, allow)
         x = x + self.spatial(self.ln_sp(x))
         x = x + self.temporal(self.ln_tp(x), allow)
         x = x + self.cross(self.ln_cr(x), code, code_mask)
@@ -157,7 +227,7 @@ class DiTBlock(nn.Module):
 class CausalDiT(nn.Module):
     def __init__(self, latent_dim=16, embed_dim=512, num_layers=12, num_heads=8,
                  num_actions=15, spatial_size=8, max_frames=64, code_dim=896,
-                 block_size=3):
+                 block_size=3, action_mode="bias", action_window=3):
         super().__init__()
         self.spatial_size = spatial_size
         S = spatial_size * spatial_size
@@ -165,6 +235,8 @@ class CausalDiT(nn.Module):
         self.embed_dim = embed_dim
         self.latent_dim = latent_dim
         self.block_size = block_size
+        self.action_mode = action_mode
+        self.action_window = action_window
 
         # project frozen code-encoder embeds (e.g. Qwen, 896-d) into model width
         self.code_proj = (nn.Linear(code_dim, embed_dim)
@@ -176,7 +248,9 @@ class CausalDiT(nn.Module):
         self.temporal_pos = nn.Parameter(torch.zeros(1, max_frames, 1, embed_dim))
 
         self.blocks = nn.ModuleList([
-            DiTBlock(embed_dim, num_heads, num_actions) for _ in range(num_layers)])
+            DiTBlock(embed_dim, num_heads, num_actions,
+                     action_mode=action_mode, action_window=action_window)
+            for _ in range(num_layers)])
         self.ln_out = nn.LayerNorm(embed_dim)
         self.output_proj = nn.Linear(embed_dim, latent_dim)     # legacy MSE path
         self.flow_out = nn.Linear(embed_dim, latent_dim)        # velocity head
