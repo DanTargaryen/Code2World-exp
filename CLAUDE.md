@@ -82,8 +82,25 @@ code(896→512) 做 cross-attn 的 K/V。**VAE 与 Qwen 全程冻结、离线预
 - ⚠️ **归一化坑(已解决)**:最初用 per-channel 单位方差归一化,遇 CoinRun「多暗+少量亮」重尾分布产生大 outlier
   (亮像素→+7),fm loss 飙到 ~20。改用标准 **[0,1]→[-1,1]**(mean/std=0.5)后 fm 起点回到 ~1.3(与 latent 版同量级)。
 - 显存实测:8×8 patch batch8 ~0.9 it/s、峰值 45GB(可跑);4×4 patch(256 token/帧)batch4 即 OOM,路径 C 不用。
-- **训练中**:GPU2,20k steps,产物 `checkpoints/code2world_act6_tc_pixel/`,日志 `model/train_pixel.log`。
-  跑完用 `rollout_compare.py --pixel` 同 ep 对比 latent 版,判断 pixel 是否更优;结论待定。
+
+### 结论(2026-07-02):**pixel-space 更糊,latent 空间胜出**
+
+跑了两版 pixel 对照(均 20k、收敛):
+- **pixel@16fps**(block_size=3,注入连续4帧,覆盖2.6s):eval fm 0.08,step6k 预览已见糊(中途停,未取满)。
+- **pixel@4fps**(分支 `exp/pixel-4fps`,block_size=1,1帧/动作,覆盖10.5s):20k done,**eval fm 0.054**(收敛),
+  产物视频 `model/outputs/pixel4fps_cmp/base_ep98_pixel_gt_vs_gen.mp4`(左GT右生成,4fps)+ grid。
+
+**三方对比(同 ep98)**:
+
+| | latent 版 | pixel@16fps | pixel@4fps |
+|---|---|---|---|
+| 收敛 eval fm | 0.14 | 0.08 | **0.054** |
+| **AR 生成锐度** | **前~15步锐利、贴GT** | step1 起糊 | **step1 即糊成绿块** |
+
+- **关键**:pixel 版 loss 更低(0.05<0.14)但**画面明显更糊** —— 印证"fm loss 不可跨表示比"(velocity 目标方差不同)。
+- **糊不是训练不足**:4fps loss 已躺平(10k 后基本不动)、仍糊 → 是方法上限。
+- **诊断**:① 4fps 帧间跳变大(0.25s/帧),单步 flow 目标分布过宽→退回糊均值;② 无 VAE 语义压缩,DiT 要在原始像素里同时管语义+几何+锐度,8×8 粗 patch 吃不消;③ block_size=1 少了块内联合去噪。
+- **决定**:**Wan VAE 的 latent 空间对生成质量真有价值,pixel-space 不是免费替代**。主线回 latent 版,pixel 路线搁置(若要救:16fps 跑满收敛再比 / 4×4 细 patch 但贵)。
 
 ### 历史进度(Stage 1 / act6,已被 Stage 2 取代)
 
