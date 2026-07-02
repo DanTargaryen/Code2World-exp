@@ -102,6 +102,24 @@ code(896→512) 做 cross-attn 的 K/V。**VAE 与 Qwen 全程冻结、离线预
 - **诊断**:① 4fps 帧间跳变大(0.25s/帧),单步 flow 目标分布过宽→退回糊均值;② 无 VAE 语义压缩,DiT 要在原始像素里同时管语义+几何+锐度,8×8 粗 patch 吃不消;③ block_size=1 少了块内联合去噪。
 - **决定**:**Wan VAE 的 latent 空间对生成质量真有价值,pixel-space 不是免费替代**。主线回 latent 版,pixel 路线搁置(若要救:16fps 跑满收敛再比 / 4×4 细 patch 但贵)。
 
+### 分支 `exp/pixel-4x4`:细 patch + 多卡 DDP(2026-07-02,进行中)
+
+试"更细 patch 能否救糊"。git 已建仓,实验按约定开分支(`main`=baseline,`exp/pixel-4fps`、`exp/pixel-4x4`)。
+- **4×4 patch 可配置化**:`--patch 4` → 每 token 48 维、grid 16×16=**256 token/帧**(8×8 是 192维/64token)。
+  DiT **结构零改动**:patch 大小只改 `latent_dim`/`spatial_size` 两个构造参数,被第一层 `input_proj` 统一投到 512 维吸收;
+  代价是 spatial attn O(S²) 从 64²→256²=**16×**,显存重(实测 4×4 batch1=23.7GB vs 8×8 batch8=45GB)。
+  `pixel_codec/pixel_dataset/train_fm_pixel/rollout_compare` 全部通 `--patch`。
+- **梯度累积** `--accum`:4×4 显存重,batch2×accum4=有效 batch8。
+- **多卡 DDP** `train_fm_pixel_ddp.py`(`torchrun --nproc_per_node=N`):
+  关键——DDP 只在 `forward()` 挂梯度同步钩子,而训练走 `forward_flow`+`forward_state` 两次前向绕过 forward,
+  故用 `FlowTrainWrapper` 把两次前向+loss 收进一个 `forward()` 再 DDP 包;`find_unused_parameters=True`
+  (CausalDiT 的 legacy `output_proj` 在 flow 路径不用);DistributedSampler+set_epoch;rank0 独占 log/eval/save。
+  2 卡已验证跑通。有效 batch = batch_size×accum×world。
+- **现状**:单卡 4×4(`1n-master-0` GPU1,`--patch 4 --stride 4 --block_size 1 --batch2 --accum4`)后台跑,
+  **但集群 8 pod×8 卡全 100% 被别人占**,只 ~0.13 it/s、10k 要 ~19h(loss 正常降,fm 0.13@step900)。
+  产物 `checkpoints/code2world_act6_tc_pixel4x4/`,日志 `model/train_pixel4x4.log`。
+- **待办**:等集群空出 ≥2 卡 → 停单卡、用 DDP 快速重跑(~2-3h)→ 对比 4×4 vs 8×8 vs latent 锐度。
+
 ### 历史进度(Stage 1 / act6,已被 Stage 2 取代)
 
 - ✅ **Stage 1(PoC,数据集 `code2world`)**:20K steps 跑通端到端,eval loss 0.0040,**无过拟合**
