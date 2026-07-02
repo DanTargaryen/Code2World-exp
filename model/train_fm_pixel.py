@@ -27,8 +27,8 @@ from train_fm import compute_loss, evaluate, prep_batch  # reused, batch-dict ag
 
 
 def build_loaders(args):
-    tr = PixelDataset(args.root, "train", args.window, args.variants, stride=args.stride)
-    ev = PixelDataset(args.root, "eval", args.window, args.variants, stride=args.stride)
+    tr = PixelDataset(args.root, "train", args.window, args.variants, stride=args.stride, patch=args.patch)
+    ev = PixelDataset(args.root, "eval", args.window, args.variants, stride=args.stride, patch=args.patch)
     print(f"train windows: {len(tr)} | eval windows: {len(ev)}", flush=True)
     code_dim = next(iter(tr.code_embeds.values())).shape[1]
     train_dl = DataLoader(tr, batch_size=args.batch_size, shuffle=True,
@@ -75,8 +75,10 @@ def main():
     ap.add_argument("--out", default="/mnt/pfs/users/huangzehuan/projects/linming/checkpoints/code2world_act6_tc_pixel")
     ap.add_argument("--window", type=int, default=41, help="steps-1 per window; latents = window+1")
     ap.add_argument("--block_size", type=int, default=3)
+    ap.add_argument("--patch", type=int, default=8, help="pixel patch size; 8->192d/8x8grid(64tok), 4->48d/16x16grid(256tok)")
     ap.add_argument("--stride", type=int, default=1, help="frame subsample; =action_repeat(4) -> 4fps 1frame/action")
     ap.add_argument("--batch_size", type=int, default=8)
+    ap.add_argument("--accum", type=int, default=1, help="梯度累积步数;有效 batch = batch_size*accum(4x4 显存重时用)")
     ap.add_argument("--num_actions", type=int, default=9)
     ap.add_argument("--embed_dim", type=int, default=512)
     ap.add_argument("--num_layers", type=int, default=12)
@@ -106,7 +108,8 @@ def main():
     L0, z, h, w = s0["latents"].shape
     print(f"pixel latents/window={L0} (window={args.window}+1) z={z} spatial={h}x{w} "
           f"| code_dim={code_dim} | block_size={args.block_size}", flush=True)
-    assert z == 192 and h == 8, f"expected 192-d 8x8 pixel patch, got z={z} spatial={h}"
+    assert z == 3 * args.patch ** 2 and h == 64 // args.patch, \
+        f"patch={args.patch} expects z={3*args.patch**2} spatial={64//args.patch}, got z={z} h={h}"
 
     model = CausalDiT(latent_dim=z, embed_dim=args.embed_dim, num_layers=args.num_layers,
                       num_heads=args.num_heads, num_actions=args.num_actions,
@@ -144,20 +147,26 @@ def main():
     for step in range(start_step, args.steps):
         for g in opt.param_groups:
             g["lr"] = lr_at(step)
-        b = next(it)
-        loss, l_fm, l_rew, l_done = compute_loss(model, b, args.num_actions, dev, amp_dtype, args.block_size)
+        # gradient accumulation: effective batch = batch_size * accum (fits big 4x4 in memory)
         opt.zero_grad(set_to_none=True)
+        acc = {"loss": 0.0, "fm": 0.0, "rew": 0.0, "done": 0.0}
+        for _a in range(args.accum):
+            b = next(it)
+            loss, l_fm, l_rew, l_done = compute_loss(model, b, args.num_actions, dev, amp_dtype, args.block_size)
+            (loss / args.accum).backward() if not scaler.is_enabled() else \
+                scaler.scale(loss / args.accum).backward()
+            acc["loss"] += loss.item() / args.accum; acc["fm"] += l_fm.item() / args.accum
+            acc["rew"] += l_rew.item() / args.accum; acc["done"] += l_done.item() / args.accum
         if scaler.is_enabled():
-            scaler.scale(loss).backward(); scaler.unscale_(opt)
+            scaler.unscale_(opt)
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             scaler.step(opt); scaler.update()
         else:
-            loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             opt.step()
 
-        run["loss"] += loss.item(); run["fm"] += l_fm.item()
-        run["rew"] += l_rew.item(); run["done"] += l_done.item(); run["n"] += 1
+        run["loss"] += acc["loss"]; run["fm"] += acc["fm"]
+        run["rew"] += acc["rew"]; run["done"] += acc["done"]; run["n"] += 1
 
         if step % args.log_every == 0 or step == args.steps - 1:
             n = max(run["n"], 1); dt = time.time() - t0
@@ -173,7 +182,7 @@ def main():
 
         if step > 0 and step % args.sample_every == 0:
             if codec is None:
-                codec = PixelCodec(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], device=dev)
+                codec = PixelCodec(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], patch=args.patch, device=dev)
             png = os.path.join(args.out, f"sample_{step:06d}.png")
             try:
                 dump_sample(model, eval_ds, codec, args.num_actions, dev,

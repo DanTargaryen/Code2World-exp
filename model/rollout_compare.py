@@ -56,6 +56,8 @@ def main():
                          "latents file is <variant>__<split>_pixel.pt (1 latent==1 frame)")
     ap.add_argument("--stride", type=int, default=1,
                     help="pixel-only frame subsample; =action_repeat(4) -> 4fps (1 frame/action)")
+    ap.add_argument("--patch", type=int, default=8,
+                    help="pixel-only patch size; 8->192d/8x8grid, 4->48d/16x16grid")
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
     dev = args.device
@@ -65,7 +67,7 @@ def main():
     ck = torch.load(args.ckpt, map_location=dev)
     cargs = ck.get("args", {})
     pixel = args.pixel
-    z, h = (192, 8) if pixel else (16, 8)
+    z, h = (3 * args.patch ** 2, 64 // args.patch) if pixel else (16, 8)
     code_bank = torch.load(os.path.join(args.root, "code_embeds.pt"), map_location="cpu")
     code_dim = next(iter(code_bank.values())).shape[1]
     model = CausalDiT(latent_dim=z, embed_dim=cargs.get("embed_dim", 512),
@@ -77,7 +79,7 @@ def main():
     model.eval()
 
     if pixel:
-        codec = PixelCodec(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], device=dev)
+        codec = PixelCodec(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], patch=args.patch, device=dev)
     else:
         codec = WanVAEWrapper(args.vae, device=dev)
 

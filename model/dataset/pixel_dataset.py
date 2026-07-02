@@ -23,11 +23,11 @@ PATCH = 8
 
 class PixelDataset(Dataset):
     def __init__(self, root, split="train", window=41, variants=("base",),
-                 mean=None, std=None, stride=1):
+                 mean=None, std=None, stride=1, patch=PATCH):
         self.root = root
         self.window = window                              # steps-1; sample = window+1 steps
         self.stride = stride                              # frame subsample; stride==ar -> 4fps (1 frame/action)
-        self.patch = PATCH
+        self.patch = patch                                # 8 -> 192-d/8x8grid; 4 -> 48-d/16x16grid
         self.code_embeds = torch.load(os.path.join(root, "code_embeds.pt"))
         self.variants = list(variants)
 
