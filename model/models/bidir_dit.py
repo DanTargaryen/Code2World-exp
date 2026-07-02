@@ -1,32 +1,25 @@
-"""Causal DiT for code-conditioned world modeling — BLOCK-AUTOREGRESSIVE flow.
+"""Bidirectional DiT for code-conditioned world modeling — flow matching.
 
 Sequence: L latents, each with S = h*w spatial tokens (8x8 = 64) -> (B, L, S, D).
-Latents are grouped into BLOCKS of `block_size` (default 3). Temporal attention is
-BLOCK-CAUSAL: latent i attends latent j iff block(j) <= block(i) — within a block
-bidirectional, across blocks causal. Generation is block-autoregressive: a whole
-block of `block_size` latents is produced jointly per AR step, conditioned on all
-earlier (clean) blocks.
+Attention is fully BIDIRECTIONAL (non-causal): every latent attends every other.
+The whole clip is denoised jointly; there is no autoregressive rollout.
 
 Wan 2.1 temporal compression gives 1 action <-> 1 latent <-> 4 frames. The first
-latent (index 0) is the INIT (encodes only frame 0), always given, never a target.
-With 42 latents = 14 blocks of 3, block 0 = {init, x1, x2}.
+latent (index 0) is the INIT (encodes only frame 0), always given clean, never a
+target. Generation denoises indices 1..L-1 from noise conditioned on the init,
+the per-latent actions and the code.
 
 Each DiT block applies, in order:
-  1. action additive bias  (Linear(num_actions, D), broadcast over S; per latent)
-     + optional tau bias    (Linear(D, D) on the timestep embedding, zero-init)
+  1. tau bias         (timestep embedding -> per-latent additive bias, zero-init)
   2. spatial self-attention   (full attention within each latent, over S tokens)
-  3. temporal block-causal attention (block-causal over L, per spatial position)
+  3. temporal self-attention  (full attention across L latents, per spatial pos)
   4. cross-attention to code tokens
-  5. FFN
+  5. action window cross-attention (Matrix-Game style: windowed actions as K/V)
+  6. FFN
 
-Two objectives share one backbone:
-  - Legacy MSE path  forward():  next-frame latent via output_proj; per-latent
-    causal mask (block_size=1), no tau. Kept for the old checkpoint.
-  - Block-AR flow (primary): the backbone IS the denoiser (single-stream
-    Diffusion Forcing). Every latent carries its own noise level tau; the init is
-    held clean (tau=1). No leak: same-block neighbours are only ever seen NOISED.
-      forward_flow(z_tau, tau, action, code)    -> per-latent velocity v = z1 - eps
-      forward_state(clean_latents, action, code) -> reward/done logits (tau-free)
+The backbone IS the denoiser (single-stream flow matching):
+  forward_flow(z_tau, tau, action, code)     -> per-latent velocity v = z1 - eps
+  forward_state(clean_latents, action, code)  -> reward/done logits (tau-free)
 """
 import math
 import torch
@@ -46,14 +39,8 @@ def timestep_embedding(t, dim, max_period=10000.0):
     return emb
 
 
-def block_causal_allow(T, block_size, device):
-    """(T,T) bool mask, True = latent i may attend latent j (block(j) <= block(i))."""
-    blk = (torch.arange(T, device=device) // block_size)
-    return blk[None, :] <= blk[:, None]    # (T_query, T_key)
-
-
 class RMSNorm(nn.Module):
-    """RMSNorm (Matrix-Game uses this for QK norm instead of LayerNorm)."""
+    """RMSNorm for QK normalisation (Matrix-Game style)."""
     def __init__(self, dim, eps=1e-6):
         super().__init__()
         self.eps = eps
@@ -65,8 +52,7 @@ class RMSNorm(nn.Module):
 
 
 def rope_freqs_1d(T, head_dim, device, theta=256.0):
-    """1D rotary freqs over a length-T axis. Returns (cos, sin) each (T, head_dim).
-    head_dim must be even (rotates dim pairs). Matches Matrix-Game's rope_theta=256."""
+    """1D rotary freqs over a length-T axis. Returns (cos, sin) each (T, head_dim)."""
     half = head_dim // 2
     inv = 1.0 / (theta ** (torch.arange(0, half, device=device).float() / half))
     pos = torch.arange(T, device=device).float()
@@ -81,8 +67,7 @@ def apply_rope(x, cos, sin):
     hd = x.shape[-1]
     x1, x2 = x[..., : hd // 2], x[..., hd // 2:]
     rot = torch.cat([-x2, x1], dim=-1)
-    # broadcast cos/sin over leading dims: (T, hd) -> (...,T,hd)
-    shape = [1] * (x.dim() - 2) + list(cos.shape)
+    shape = [1] * (x.dim() - 2) + list(cos.shape)     # broadcast over leading dims
     return x * cos.view(*shape) + rot * sin.view(*shape)
 
 
@@ -107,27 +92,23 @@ class SpatialSelfAttention(nn.Module):
         return self.proj(out)
 
 
-class TemporalBlockAttention(nn.Module):
-    """Block-causal attention across L latents, independently per spatial position.
-
-    `allow` is a (L, L) bool mask (True = attend); block_size=1 recovers plain
-    causal. Bidirectional within a block, causal across blocks.
-    """
+class TemporalSelfAttention(nn.Module):
+    """Full (bidirectional) attention across L latents, per spatial position."""
     def __init__(self, dim, num_heads):
         super().__init__()
         self.num_heads = num_heads
         self.qkv = nn.Linear(dim, dim * 3)
         self.proj = nn.Linear(dim, dim)
 
-    def forward(self, x, allow):
-        # x: (B, T, S, D)   allow: (T, T) bool
+    def forward(self, x):
+        # x: (B, T, S, D)
         B, T, S, D = x.shape
         qkv = self.qkv(x).reshape(B, T, S, 3, self.num_heads, D // self.num_heads)
         q, k, v = qkv.unbind(3)  # (B, T, S, nh, hd)
         q = q.permute(0, 2, 4, 1, 3)  # (B, S, nh, T, hd)
         k = k.permute(0, 2, 4, 1, 3)
         v = v.permute(0, 2, 4, 1, 3)
-        out = F.scaled_dot_product_attention(q, k, v, attn_mask=allow[None, None, None])
+        out = F.scaled_dot_product_attention(q, k, v)
         out = out.permute(0, 3, 1, 4, 2).reshape(B, T, S, D)
         return self.proj(out)
 
@@ -151,9 +132,7 @@ class CrossAttention(nn.Module):
         k, v = kv.unbind(2)
         k = k.transpose(1, 2)  # (B, nh, N, hd)
         v = v.transpose(1, 2)
-        attn_mask = None
-        if code_mask is not None:
-            attn_mask = code_mask[:, None, None, :]
+        attn_mask = code_mask[:, None, None, :] if code_mask is not None else None
         out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)  # (B, nh, T*S, hd)
         out = out.transpose(1, 2).reshape(B, T, S, D)
         return self.proj(out)
@@ -162,24 +141,15 @@ class CrossAttention(nn.Module):
 class ActionWindowCrossAttention(nn.Module):
     """Window-conditioned action injection (Matrix-Game style, adapted).
 
-    Matrix-Game gives one action per RAW frame and pulls a window of
-    vae_ratio*windows_size raw frames per latent. Code2world is already
-    time-compressed offline (1 latent <-> 1 action <-> 4 frames), so the window
-    is taken directly in LATENT units: for latent i we gather actions
-    [i-(W-1) .. i] (left-padded with zeros = "no history"), giving each latent
-    the current action plus the previous W-1. That W-latent window equals the
-    3-latent (=12 raw-frame) context Matrix-Game uses at W=3.
+    Code2world is time-compressed offline (1 latent <-> 1 action <-> 4 frames), so
+    the action window is taken directly in LATENT units: for latent i we gather
+    actions [i-(W-1) .. i], giving each latent the current action plus the previous
+    W-1. The windowed features become per-latent K/V; visual tokens are the query,
+    attending over the temporal axis per spatial position (bidirectional).
 
-    The windowed action features become per-latent K/V; the visual tokens are the
-    query. Attention runs over the temporal axis per spatial position, masked by
-    the SAME block-causal `allow` used by temporal self-attention (Matrix-Game is
-    non-causal; we keep it causal to avoid AR leakage). The output projection is
-    zero-init so an untrained block reduces to the identity (stable start, on par
-    with the additive-bias path).
-
-    Matrix-Game alignment: QK use RMSNorm (not LayerNorm), q/k carry 1D RoPE over
-    the temporal axis (theta=256), and the left window pad repeats the FIRST action
-    (not zeros) so early latents see a plausible history rather than a null one.
+    Matrix-Game alignment: QK use RMSNorm, q/k carry 1D RoPE over the temporal axis
+    (theta=256), and the left window pad repeats the FIRST action (not zeros).
+    Output projection is zero-init so an untrained block reduces to the identity.
     """
     def __init__(self, dim, num_heads, num_actions, window=3, act_hidden=128,
                  rope_theta=256.0):
@@ -197,20 +167,19 @@ class ActionWindowCrossAttention(nn.Module):
         self.proj = nn.Linear(dim, dim)
         nn.init.zeros_(self.proj.weight); nn.init.zeros_(self.proj.bias)
 
-    def forward(self, x, action_onehot, allow):
-        # x: (B,T,S,D)  action_onehot: (B,T,A)  allow: (T,T) bool
+    def forward(self, x, action_onehot):
+        # x: (B,T,S,D)  action_onehot: (B,T,A)
         B, T, S, D = x.shape
         nh, hd = self.num_heads, D // self.num_heads
-        a = self.act_embed(action_onehot)                       # (B,T,H)
         W = self.window
+        a = self.act_embed(action_onehot)                       # (B,T,H)
         # left-pad W-1 by REPEATING the first action, then sliding window concat
         a_pad = torch.cat([a[:, :1].expand(B, W - 1, a.shape[-1]), a], dim=1)  # (B,T+W-1,H)
         win = torch.stack([a_pad[:, i:i + T] for i in range(W)], dim=2)  # (B,T,W,H)
         win = win.reshape(B, T, -1)                            # (B,T,H*W)
         kv = self.kv(win).reshape(B, T, 2, nh, hd)
         k, v = kv.unbind(2)                                    # each (B,T,nh,hd)
-        q = self.q(x).reshape(B, T, S, nh, hd)
-        q = self.q_norm(q)
+        q = self.q_norm(self.q(x).reshape(B, T, S, nh, hd))
         k = self.k_norm(k)
         # RoPE over the temporal axis (per latent position t in [0,T))
         cos, sin = rope_freqs_1d(T, hd, x.device, self.rope_theta)
@@ -218,76 +187,50 @@ class ActionWindowCrossAttention(nn.Module):
         k = apply_rope(k.permute(0, 2, 1, 3), cos, sin)        # (B,nh,T,hd)
         k = k.unsqueeze(1).expand(B, S, nh, T, hd)
         v = v.permute(0, 2, 1, 3).unsqueeze(1).expand(B, S, nh, T, hd)
-        out = F.scaled_dot_product_attention(q, k, v, attn_mask=allow[None, None, None])
+        out = F.scaled_dot_product_attention(q, k, v)
         out = out.permute(0, 3, 1, 2, 4).reshape(B, T, S, D)   # (B,T,S,D)
         return self.proj(out)
 
 
 class DiTBlock(nn.Module):
-    def __init__(self, dim, num_heads, num_actions, mlp_ratio=4.0,
-                 action_mode="bias", action_window=3):
+    def __init__(self, dim, num_heads, num_actions, action_window=3, mlp_ratio=4.0):
         super().__init__()
-        self.action_mode = action_mode
-        if action_mode == "bias":
-            self.action_proj = nn.Linear(num_actions, dim, bias=False)
-        elif action_mode == "crossattn":
-            self.ln_act = nn.LayerNorm(dim)
-            self.action_cross = ActionWindowCrossAttention(
-                dim, num_heads, num_actions, window=action_window)
-        else:
-            raise ValueError(f"unknown action_mode {action_mode}")
         self.tau_proj = nn.Linear(dim, dim)            # injects timestep embedding
         nn.init.zeros_(self.tau_proj.weight); nn.init.zeros_(self.tau_proj.bias)
         self.ln_sp = nn.LayerNorm(dim)
         self.spatial = SpatialSelfAttention(dim, num_heads)
         self.ln_tp = nn.LayerNorm(dim)
-        self.temporal = TemporalBlockAttention(dim, num_heads)
+        self.temporal = TemporalSelfAttention(dim, num_heads)
         self.ln_cr = nn.LayerNorm(dim)
         self.cross = CrossAttention(dim, num_heads)
+        self.ln_act = nn.LayerNorm(dim)
+        self.action_cross = ActionWindowCrossAttention(dim, num_heads, num_actions,
+                                                       window=action_window)
         self.ln_ff = nn.LayerNorm(dim)
         hidden = int(dim * mlp_ratio)
         self.ff = nn.Sequential(nn.Linear(dim, hidden), nn.GELU(), nn.Linear(hidden, dim))
 
-    def forward(self, x, action_onehot, code, allow, code_mask=None, t_emb=None):
-        # action_onehot: (B, T, num_actions); t_emb: (B, T, D) or None
-        if self.action_mode == "bias":
-            # action bias (+ tau) injected up front, before all attention
-            bias = self.action_proj(action_onehot)
-            if t_emb is not None:
-                bias = bias + self.tau_proj(t_emb)
-            x = x + bias.unsqueeze(2)
-            x = x + self.spatial(self.ln_sp(x))
-            x = x + self.temporal(self.ln_tp(x), allow)
-            x = x + self.cross(self.ln_cr(x), code, code_mask)
-            x = x + self.ff(self.ln_ff(x))
-        else:  # crossattn: action injected AFTER cross-attn, before FFN (Matrix-Game
-                # position, model.py cross_attn_ffn). tau stays up front so the noise
-                # level still conditions self-/temporal-attention.
-            if t_emb is not None:
-                x = x + self.tau_proj(t_emb).unsqueeze(2)
-            x = x + self.spatial(self.ln_sp(x))
-            x = x + self.temporal(self.ln_tp(x), allow)
-            x = x + self.cross(self.ln_cr(x), code, code_mask)
-            x = x + self.action_cross(self.ln_act(x), action_onehot, allow)
-            x = x + self.ff(self.ln_ff(x))
+    def forward(self, x, action_onehot, code, code_mask, t_emb):
+        # x: (B,T,S,D)  action_onehot: (B,T,A)  t_emb: (B,T,D)
+        x = x + self.tau_proj(t_emb).unsqueeze(2)                 # noise-level conditioning
+        x = x + self.spatial(self.ln_sp(x))
+        x = x + self.temporal(self.ln_tp(x))
+        x = x + self.cross(self.ln_cr(x), code, code_mask)
+        x = x + self.action_cross(self.ln_act(x), action_onehot)  # Matrix-Game position
+        x = x + self.ff(self.ln_ff(x))
         return x
 
 
-class CausalDiT(nn.Module):
+class BidirDiT(nn.Module):
     def __init__(self, latent_dim=16, embed_dim=512, num_layers=12, num_heads=8,
-                 num_actions=15, spatial_size=8, max_frames=64, code_dim=896,
-                 block_size=3, action_mode="bias", action_window=3,
-                 attn_mode="block_causal"):
+                 num_actions=6, spatial_size=8, max_frames=64, code_dim=896,
+                 action_window=3):
         super().__init__()
-        assert attn_mode in ("block_causal", "bidir")
         self.spatial_size = spatial_size
         S = spatial_size * spatial_size
         self.S = S
         self.embed_dim = embed_dim
         self.latent_dim = latent_dim
-        self.block_size = block_size
-        self.attn_mode = attn_mode
-        self.action_mode = action_mode
         self.action_window = action_window
 
         # project frozen code-encoder embeds (e.g. Qwen, 896-d) into model width
@@ -300,11 +243,9 @@ class CausalDiT(nn.Module):
         self.temporal_pos = nn.Parameter(torch.zeros(1, max_frames, 1, embed_dim))
 
         self.blocks = nn.ModuleList([
-            DiTBlock(embed_dim, num_heads, num_actions,
-                     action_mode=action_mode, action_window=action_window)
+            DiTBlock(embed_dim, num_heads, num_actions, action_window=action_window)
             for _ in range(num_layers)])
         self.ln_out = nn.LayerNorm(embed_dim)
-        self.output_proj = nn.Linear(embed_dim, latent_dim)     # legacy MSE path
         self.flow_out = nn.Linear(embed_dim, latent_dim)        # velocity head
         nn.init.zeros_(self.flow_out.weight); nn.init.zeros_(self.flow_out.bias)
 
@@ -312,14 +253,14 @@ class CausalDiT(nn.Module):
         self.tau_mlp = nn.Sequential(
             nn.Linear(embed_dim, embed_dim), nn.SiLU(), nn.Linear(embed_dim, embed_dim))
 
-        # auxiliary heads (per-latent: pool spatial tokens of the CLEAN pass)
+        # auxiliary heads (per-latent: pool spatial tokens of the clean pass)
         self.reward_head = nn.Linear(embed_dim, 3)   # -1 / 0 / +1
         self.done_head = nn.Linear(embed_dim, 2)
 
         nn.init.trunc_normal_(self.spatial_pos, std=0.02)
         nn.init.trunc_normal_(self.temporal_pos, std=0.02)
 
-    def _run_backbone(self, latents, action_onehot, code, code_mask, block_size, t_emb):
+    def _run_backbone(self, latents, action_onehot, code, code_mask, t_emb):
         """latents: (B,L,C,h,w) -> features (B,L,S,D). action_onehot: (B,L,A)."""
         B, L, C, h, w = latents.shape
         S = h * w
@@ -327,85 +268,39 @@ class CausalDiT(nn.Module):
         x = latents.permute(0, 1, 3, 4, 2).reshape(B, L, S, C)  # (B,L,S,C)
         x = self.input_proj(x)                                  # (B,L,S,D)
         x = x + self.spatial_pos + self.temporal_pos[:, :L]
-        if self.attn_mode == "bidir":
-            allow = torch.ones(L, L, dtype=torch.bool, device=x.device)  # full (non-causal)
-        else:
-            allow = block_causal_allow(L, block_size, x.device)     # (L,L) bool
         for blk in self.blocks:
-            x = blk(x, action_onehot, code, allow, code_mask, t_emb)
+            x = blk(x, action_onehot, code, code_mask, t_emb)
         return self.ln_out(x)                                   # (B,L,S,D)
 
-    def forward(self, latents, action_onehot, code, code_mask=None):
-        """LEGACY MSE path: per-latent causal, predict NEXT-frame latent.
-        returns pred (B,T,C,h,w), reward_logits (B,T,3), done_logits (B,T,2)."""
-        B, T, C, h, w = latents.shape
-        x = self._run_backbone(latents, action_onehot, code, code_mask, 1, None)
-        pred = self.output_proj(x).reshape(B, T, h, w, C).permute(0, 1, 4, 2, 3)
-        pooled = x.mean(dim=2)
-        return pred, self.reward_head(pooled), self.done_head(pooled)
-
     def forward_flow(self, z_tau, tau, action_onehot, code, code_mask=None):
-        """Block-AR flow: predict per-latent velocity v = z1 - eps.
+        """Predict per-latent velocity v = z1 - eps.
         z_tau: (B,L,C,h,w) noised latents (init held clean)
         tau:   (B,L) in [0,1]   action_onehot: (B,L,A) (pos 0 = null action)
         returns velocity (B,L,C,h,w)."""
         B, L, C, h, w = z_tau.shape
         t_emb = self.tau_mlp(timestep_embedding(tau, self.embed_dim))     # (B,L,D)
-        x = self._run_backbone(z_tau, action_onehot, code, code_mask, self.block_size, t_emb)
+        x = self._run_backbone(z_tau, action_onehot, code, code_mask, t_emb)
         return self.flow_out(x).reshape(B, L, h, w, C).permute(0, 1, 4, 2, 3)
 
     def forward_state(self, latents, action_onehot, code, code_mask=None):
-        """reward/done from a CLEAN, tau-free pass (per-latent causal).
+        """reward/done from a CLEAN, tau-free pass.
         returns reward_logits (B,L,3), done_logits (B,L,2)."""
-        x = self._run_backbone(latents, action_onehot, code, code_mask, 1, None)
+        t_emb = self.tau_mlp(timestep_embedding(torch.ones(*latents.shape[:2],
+                                                           device=latents.device),
+                                                self.embed_dim))
+        x = self._run_backbone(latents, action_onehot, code, code_mask, t_emb)
         pooled = x.mean(dim=2)
         return self.reward_head(pooled), self.done_head(pooled)
 
 
 @torch.no_grad()
-def block_ar_generate(model, init_latent, actions, code, num_actions, dev,
-                      block_size, flow_steps, code_mask=None):
-    """Block-autoregressive rollout for the flow model.
-
-    init_latent: (1, 1, C, h, w) clean INIT latent (index 0).
-    actions:     length-K sequence; produces K latents -> total L = K+1 (<= max_frames).
-    Each AR step denoises the next block of latents (block 0 emits block_size-1
-    because the init fills one slot; later blocks emit block_size) jointly via Euler
-    integration from noise, with the clean history held at tau=1.
-    Returns the full latent sequence (1, K+1, C, h, w) including the init.
-    """
-    L_target = len(actions) + 1
-    hist = init_latent.clone()                                    # (1, 1, C, h, w) clean
-    Cshape = init_latent.shape[2:]
-    dt = 1.0 / flow_steps
-    while hist.shape[1] < L_target:
-        cur = hist.shape[1]
-        b = block_size - (cur % block_size) if (cur % block_size) else block_size
-        b = min(b, L_target - cur)
-        seqlen = cur + b
-        a_full = torch.zeros(1, seqlen, num_actions, device=dev)
-        for i in range(1, seqlen):
-            a_full[0, i, int(actions[i - 1])] = 1.0
-        z_block = torch.randn(1, b, *Cshape, device=dev)
-        for s in range(flow_steps):
-            seq = torch.cat([hist, z_block], dim=1)              # (1, seqlen, C, h, w)
-            tau = torch.ones(1, seqlen, device=dev)
-            tau[:, cur:] = s * dt                                 # history clean, block noised
-            v = model.forward_flow(seq, tau, a_full, code, code_mask)[:, cur:cur + b]
-            z_block = z_block + dt * v.float()
-        hist = torch.cat([hist, z_block], dim=1)
-    return hist                                                   # (1, L_target, C, h, w)
-
-
-@torch.no_grad()
 def full_seq_generate(model, init_latent, actions, code, num_actions, dev,
                       flow_steps, code_mask=None):
-    """Bidirectional (non-causal) generation: denoise the WHOLE sequence at once.
+    """Bidirectional generation: denoise the WHOLE sequence jointly.
 
-    With bidirectional attention there is no causal ordering to roll out block by
-    block, so we generate a single fixed-length clip: the init (index 0) is held
-    clean, every other latent starts from noise and is integrated jointly with one
-    shared tau. Length is fixed by len(actions) (= training window), NOT arbitrary.
+    The init (index 0) is held clean; every other latent starts from noise and is
+    integrated with one shared tau via Euler steps. Length is fixed by len(actions)
+    (= training window), NOT arbitrary.
 
     init_latent: (1, 1, C, h, w) clean INIT. actions: length-K -> total L = K+1.
     Returns (1, K+1, C, h, w) including the init.

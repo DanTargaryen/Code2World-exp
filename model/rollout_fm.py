@@ -1,11 +1,9 @@
-"""Block-autoregressive flow rollout: fix the INIT latent, feed a hand-crafted
-action sequence, generate latents block-by-block (block_size at a time), decode the
-whole latent sequence with the TEMPORAL VAE (1 latent -> 4 frames), dump an mp4 + grid.
+"""Bidirectional flow rollout: fix the INIT latent, feed a hand-crafted action
+sequence, denoise the WHOLE latent sequence jointly, decode with the TEMPORAL VAE
+(1 latent -> 4 frames), dump an mp4 + annotated grid.
 
-Each AR step denoises the next block jointly via Euler integration from noise, with
-the clean history held at tau=1 (see models.causal_dit.block_ar_generate).
-
-Target: ~10s @16fps. With block_size=3 and 41 actions -> 42 latents -> 165 frames.
+Length is fixed by the sequence (init + n_actions latents), best kept at the trained
+window. Target: ~10s @16fps -> 41 actions -> 42 latents -> 165 frames.
 Action ids (CoinRun set_action_xy, act6 subset):
   7=右  8=右上(跳+右)  5=上(原地跳)  1=左  2=左上  4=停
 """
@@ -14,7 +12,7 @@ import numpy as np
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from models.causal_dit import CausalDiT, block_ar_generate, full_seq_generate
+from models.bidir_dit import BidirDiT, full_seq_generate
 from models.vae import WanVAEWrapper
 from action_space import remap_to_compact, NUM_ACTIONS_COMPACT
 
@@ -29,9 +27,7 @@ def main():
     ap.add_argument("--variant", default="base")
     ap.add_argument("--split", default="episodes_eval")
     ap.add_argument("--ep", type=int, default=0)
-    ap.add_argument("--block_size", type=int, default=3)
     ap.add_argument("--flow_steps", type=int, default=16)
-    ap.add_argument("--num_actions", type=int, default=9)
     ap.add_argument("--n_actions", type=int, default=41, help="latent steps to generate (->10s @16fps)")
     ap.add_argument("--fps", type=int, default=16)
     ap.add_argument("--out", default="outputs/custom_rollout_fm")
@@ -42,29 +38,23 @@ def main():
 
     # hand-crafted action sequence (length n_actions), in RAW Procgen ids: 右/右上/上
     base = ([7] * 6 + [8] * 6 + [5] * 4 + [7] * 4 + [8] * 4 + [5] * 4 + [7] * 4)
-    ACTIONS = (base * ((args.n_actions // len(base)) + 1))[:args.n_actions]
-    ACTIONS_RAW = list(ACTIONS)          # keep raw ids for human-readable labels
+    ACTIONS_RAW = (base * ((args.n_actions // len(base)) + 1))[:args.n_actions]
+    ACTIONS = remap_to_compact(torch.as_tensor(ACTIONS_RAW, dtype=torch.long)).tolist()
     print(f"action seq (len {len(ACTIONS)})", flush=True)
 
     ck = torch.load(args.ckpt, map_location=dev)
     cargs = ck.get("args", {})
-    # match the training-time action encoding stored in the ckpt
-    compact = bool(cargs.get("action_compact", False))
-    if compact:
-        args.num_actions = NUM_ACTIONS_COMPACT
-        ACTIONS = remap_to_compact(torch.as_tensor(ACTIONS, dtype=torch.long)).tolist()
-        print(f"  [compact] remapped actions to dense [0..{NUM_ACTIONS_COMPACT-1}]", flush=True)
+    if len(ACTIONS) != cargs.get("window", 41):
+        print(f"  [note] n_actions={len(ACTIONS)} != train window={cargs.get('window', 41)}; "
+              f"bidir is fixed-length, results best at the trained length", flush=True)
     z, h = 16, 8
     code_bank = torch.load(os.path.join(args.root, "code_embeds.pt"), map_location="cpu")
     code_dim = next(iter(code_bank.values())).shape[1]
-    model = CausalDiT(latent_dim=z, embed_dim=cargs.get("embed_dim", 512),
-                      num_layers=cargs.get("num_layers", 12), num_heads=cargs.get("num_heads", 8),
-                      num_actions=args.num_actions, spatial_size=h,
-                      max_frames=cargs.get("window", 41) + 1, code_dim=code_dim,
-                      block_size=cargs.get("block_size", args.block_size),
-                      action_mode=cargs.get("action_mode", "bias"),
-                      action_window=cargs.get("action_window", 3),
-                      attn_mode=cargs.get("attn_mode", "block_causal")).to(dev)
+    model = BidirDiT(latent_dim=z, embed_dim=cargs.get("embed_dim", 512),
+                     num_layers=cargs.get("num_layers", 12), num_heads=cargs.get("num_heads", 8),
+                     num_actions=NUM_ACTIONS_COMPACT, spatial_size=h,
+                     max_frames=cargs.get("window", 41) + 1, code_dim=code_dim,
+                     action_window=cargs.get("action_window", 3)).to(dev)
     model.load_state_dict(ck["model"]); model.eval()
     print(f"loaded {args.ckpt} (step {ck.get('step')})", flush=True)
 
@@ -78,19 +68,8 @@ def main():
     init_latent = lat_all["latents"][l0:l0 + 1].float().unsqueeze(0).to(dev)   # (1,1,z,h,w)
     code = code_bank[args.variant].float().unsqueeze(0).to(dev)
 
-    attn_mode = cargs.get("attn_mode", "block_causal")
-    if attn_mode == "bidir":
-        # non-causal: whole sequence denoised jointly, fixed length = len(ACTIONS)+1.
-        # Best kept equal to the training window; longer than that is out of distribution.
-        win = cargs.get("window", 41)
-        if len(ACTIONS) != win:
-            print(f"  [bidir] note: n_actions={len(ACTIONS)} != train window={win}; "
-                  f"bidir is fixed-length, results best at the trained length", flush=True)
-        gen = full_seq_generate(model, init_latent, ACTIONS, code, args.num_actions,
-                                dev, args.flow_steps)[0]
-    else:
-        gen = block_ar_generate(model, init_latent, ACTIONS, code, args.num_actions, dev,
-                                cargs.get("block_size", args.block_size), args.flow_steps)[0]
+    gen = full_seq_generate(model, init_latent, ACTIONS, code, NUM_ACTIONS_COMPACT,
+                            dev, args.flow_steps)[0]
     frames = vae.decode_video(gen)                              # (4*(L-1)+1, 3, H, W)
     imgs = [(frames[i].permute(1, 2, 0).clamp(0, 1).cpu().numpy() * 255).astype(np.uint8)
             for i in range(frames.shape[0])]
@@ -113,7 +92,7 @@ def main():
     while len(tiles) % per_row:
         tiles.append(np.zeros_like(tiles[0]))
     rows = [np.concatenate(tiles[r:r + per_row], 1) for r in range(0, len(tiles), per_row)]
-    grid_path = os.path.join(args.out, f"{args.variant}_blockar_grid.png")
+    grid_path = os.path.join(args.out, f"{args.variant}_grid.png")
     cv2.imwrite(grid_path, cv2.cvtColor(np.concatenate(rows, 0), cv2.COLOR_RGB2BGR))
     print(f"saved grid -> {grid_path}", flush=True)
 
@@ -125,7 +104,7 @@ def main():
         p = subprocess.Popen([ff, "-y", "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{OW}x{OH}",
                               "-r", str(args.fps), "-i", "-", "-c:v", "libx264", "-pix_fmt",
                               "yuv420p", "-crf", "18",
-                              os.path.join(args.out, f"{args.variant}_blockar.mp4")],
+                              os.path.join(args.out, f"{args.variant}.mp4")],
                              stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         for im in imgs:
             p.stdin.write(np.ascontiguousarray(
