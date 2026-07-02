@@ -93,6 +93,33 @@ action(6维one-hot,窗口) ──window cross-attn──────────
 - ⏳ **待办**:上 pod 训练验证(`--window 41 --batch_size 8 --steps 10000 --eval_every 500`),
   对比 bidir 画质 vs main 的 block-AR;若优则跑满 20k 出定稿。
 
+### 方向调整(2026-07-02 讨论后):转「逐帧 action + 因果 block-AR」,bidir 暂搁置
+
+目标澄清为 **(a) 忠实复刻 Matrix-Game 的 action 注入机制并验证其在 code-conditioned 场景的效果**。
+据此两点修正:
+1. **外层范式**:全局 bidir 是我们引入的**偏离**(Matrix-Game 是因果/交互式)。改回**因果 block-AR**
+   (档次1:复用 block-causal + block_ar_generate,不含 memory/KV-cache/sliding window)。bidir 留作对照分支。
+2. **action 粒度**:改**逐帧**(每 latent 吃 4 个逐帧 action,回到 Matrix-Game 原始
+   `act_hidden × vae_ratio(4) × window` 维度),当前「1 action=1 latent」发挥不出 window cross-attn。
+- **Ablation**(验证机制价值):① 加性 bias(单动作) ② window cross-attn(逐帧W窗口) ③(可选)crossattn 但只喂当前 latent。
+
+### ✅ VAE go/no-go 前置实验(2026-07-02,**通过**)
+
+逐帧方案的命门:VAE 把 4 帧压成 1 latent,latent 内的帧间运动是否保留?(不保留则逐帧 action 无可学 target)
+- 脚本 `vae_intra_latent_probe.py`:取 16 个运动最剧烈的 4 帧片段,`encode_video→decode_video`,
+  比较 latent 内帧间运动 pre/post。
+- 结果:**运动保留率 post/pre = 0.957 均值 / 0.943 中位**,重建 L1=0.046;可视化(`outputs/vae_probe/`)
+  角色的水平位移/跳跃轨迹/平台位移在重建里逐帧对得上。
+- **判定 GO**:latent 确编码 latent 内运动(~95%),逐帧 action 有物理可学目标。
+  边界:现有数据是「同 action 的自然运动」,未含「latent 内 action 切换」样本;但切换引起的运动更显著,风险低,严格证明待重采。
+
+### 下一步
+
+1. 开分支 `exp/action-perframe`(从 `exp/action-window` 起,已有 crossattn+block-causal)。
+2. 改采集:`action_repeat=4` 帧结构不变,但**每帧记录真实 action** + **分段持续采样**(动作持续随机 N 帧、不对齐 latent 边界)。
+3. 改注入维度(×vae_ratio)+ dataset 读逐帧 action + 回 block-causal。
+4. 训练跑 ablation 对比。
+
 ## 6. 目录结构(本分支已精简)
 
 ```
