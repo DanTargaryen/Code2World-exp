@@ -52,6 +52,40 @@ def block_causal_allow(T, block_size, device):
     return blk[None, :] <= blk[:, None]    # (T_query, T_key)
 
 
+class RMSNorm(nn.Module):
+    """RMSNorm (Matrix-Game uses this for QK norm instead of LayerNorm)."""
+    def __init__(self, dim, eps=1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x):
+        x = x * torch.rsqrt(x.float().pow(2).mean(-1, keepdim=True) + self.eps).to(x.dtype)
+        return x * self.weight
+
+
+def rope_freqs_1d(T, head_dim, device, theta=256.0):
+    """1D rotary freqs over a length-T axis. Returns (cos, sin) each (T, head_dim).
+    head_dim must be even (rotates dim pairs). Matches Matrix-Game's rope_theta=256."""
+    half = head_dim // 2
+    inv = 1.0 / (theta ** (torch.arange(0, half, device=device).float() / half))
+    pos = torch.arange(T, device=device).float()
+    ang = torch.outer(pos, inv)                       # (T, half)
+    cos = torch.cos(ang).repeat(1, 2)                 # (T, head_dim)
+    sin = torch.sin(ang).repeat(1, 2)
+    return cos, sin
+
+
+def apply_rope(x, cos, sin):
+    """Apply RoPE to x (..., T, head_dim) with cos/sin (T, head_dim). rotate_half style."""
+    hd = x.shape[-1]
+    x1, x2 = x[..., : hd // 2], x[..., hd // 2:]
+    rot = torch.cat([-x2, x1], dim=-1)
+    # broadcast cos/sin over leading dims: (T, hd) -> (...,T,hd)
+    shape = [1] * (x.dim() - 2) + list(cos.shape)
+    return x * cos.view(*shape) + rot * sin.view(*shape)
+
+
 class SpatialSelfAttention(nn.Module):
     """Full attention among the S spatial tokens within each latent."""
     def __init__(self, dim, num_heads):
@@ -142,18 +176,24 @@ class ActionWindowCrossAttention(nn.Module):
     non-causal; we keep it causal to avoid AR leakage). The output projection is
     zero-init so an untrained block reduces to the identity (stable start, on par
     with the additive-bias path).
+
+    Matrix-Game alignment: QK use RMSNorm (not LayerNorm), q/k carry 1D RoPE over
+    the temporal axis (theta=256), and the left window pad repeats the FIRST action
+    (not zeros) so early latents see a plausible history rather than a null one.
     """
-    def __init__(self, dim, num_heads, num_actions, window=3, act_hidden=128):
+    def __init__(self, dim, num_heads, num_actions, window=3, act_hidden=128,
+                 rope_theta=256.0):
         super().__init__()
         self.num_heads = num_heads
         self.window = window
+        self.rope_theta = rope_theta
         self.act_embed = nn.Sequential(
             nn.Linear(num_actions, act_hidden, bias=True), nn.SiLU(),
             nn.Linear(act_hidden, act_hidden, bias=True))
         self.q = nn.Linear(dim, dim)
         self.kv = nn.Linear(act_hidden * window, dim * 2)
-        self.q_norm = nn.LayerNorm(dim // num_heads)
-        self.k_norm = nn.LayerNorm(dim // num_heads)
+        self.q_norm = RMSNorm(dim // num_heads)
+        self.k_norm = RMSNorm(dim // num_heads)
         self.proj = nn.Linear(dim, dim)
         nn.init.zeros_(self.proj.weight); nn.init.zeros_(self.proj.bias)
 
@@ -163,8 +203,8 @@ class ActionWindowCrossAttention(nn.Module):
         nh, hd = self.num_heads, D // self.num_heads
         a = self.act_embed(action_onehot)                       # (B,T,H)
         W = self.window
-        # left-pad W-1 with zeros, then sliding window concat -> (B,T,H*W)
-        a_pad = F.pad(a, (0, 0, W - 1, 0))                      # (B, T+W-1, H)
+        # left-pad W-1 by REPEATING the first action, then sliding window concat
+        a_pad = torch.cat([a[:, :1].expand(B, W - 1, a.shape[-1]), a], dim=1)  # (B,T+W-1,H)
         win = torch.stack([a_pad[:, i:i + T] for i in range(W)], dim=2)  # (B,T,W,H)
         win = win.reshape(B, T, -1)                            # (B,T,H*W)
         kv = self.kv(win).reshape(B, T, 2, nh, hd)
@@ -172,9 +212,11 @@ class ActionWindowCrossAttention(nn.Module):
         q = self.q(x).reshape(B, T, S, nh, hd)
         q = self.q_norm(q)
         k = self.k_norm(k)
-        # attend over time per spatial position: q (B,S,nh,T,hd) x k (B,S,nh,T,hd)
-        q = q.permute(0, 2, 3, 1, 4)                           # (B,S,nh,T,hd)
-        k = k.permute(0, 2, 1, 3).unsqueeze(1).expand(B, S, nh, T, hd)
+        # RoPE over the temporal axis (per latent position t in [0,T))
+        cos, sin = rope_freqs_1d(T, hd, x.device, self.rope_theta)
+        q = apply_rope(q.permute(0, 2, 3, 1, 4), cos, sin)     # (B,S,nh,T,hd)
+        k = apply_rope(k.permute(0, 2, 1, 3), cos, sin)        # (B,nh,T,hd)
+        k = k.unsqueeze(1).expand(B, S, nh, T, hd)
         v = v.permute(0, 2, 1, 3).unsqueeze(1).expand(B, S, nh, T, hd)
         out = F.scaled_dot_product_attention(q, k, v, attn_mask=allow[None, None, None])
         out = out.permute(0, 3, 1, 2, 4).reshape(B, T, S, D)   # (B,T,S,D)
