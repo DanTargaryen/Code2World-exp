@@ -209,18 +209,25 @@ class DiTBlock(nn.Module):
     def forward(self, x, action_onehot, code, allow, code_mask=None, t_emb=None):
         # action_onehot: (B, T, num_actions); t_emb: (B, T, D) or None
         if self.action_mode == "bias":
+            # action bias (+ tau) injected up front, before all attention
             bias = self.action_proj(action_onehot)
             if t_emb is not None:
                 bias = bias + self.tau_proj(t_emb)
             x = x + bias.unsqueeze(2)
-        else:  # crossattn: window action as K/V, visual tokens as query
+            x = x + self.spatial(self.ln_sp(x))
+            x = x + self.temporal(self.ln_tp(x), allow)
+            x = x + self.cross(self.ln_cr(x), code, code_mask)
+            x = x + self.ff(self.ln_ff(x))
+        else:  # crossattn: action injected AFTER cross-attn, before FFN (Matrix-Game
+                # position, model.py cross_attn_ffn). tau stays up front so the noise
+                # level still conditions self-/temporal-attention.
             if t_emb is not None:
                 x = x + self.tau_proj(t_emb).unsqueeze(2)
+            x = x + self.spatial(self.ln_sp(x))
+            x = x + self.temporal(self.ln_tp(x), allow)
+            x = x + self.cross(self.ln_cr(x), code, code_mask)
             x = x + self.action_cross(self.ln_act(x), action_onehot, allow)
-        x = x + self.spatial(self.ln_sp(x))
-        x = x + self.temporal(self.ln_tp(x), allow)
-        x = x + self.cross(self.ln_cr(x), code, code_mask)
-        x = x + self.ff(self.ln_ff(x))
+            x = x + self.ff(self.ln_ff(x))
         return x
 
 
