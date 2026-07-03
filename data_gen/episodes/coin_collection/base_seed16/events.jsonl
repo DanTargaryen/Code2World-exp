@@ -1,7 +1,0 @@
-{"t":50,"type":"coin_collected","coin_id":0,"x":1.9446490673348311,"y":-5.264036040566862}
-{"t":94,"type":"wall_hit"}
-{"t":95,"type":"wall_hit"}
-{"t":96,"type":"wall_hit"}
-{"t":139,"type":"coin_collected","coin_id":9,"x":5.1572591544128965,"y":-5.007890796847642}
-{"t":235,"type":"coin_collected","coin_id":10,"x":2.973754345346242,"y":-2.686358079593629}
-{"t":300,"type":"terminate","reason":"time_limit"}

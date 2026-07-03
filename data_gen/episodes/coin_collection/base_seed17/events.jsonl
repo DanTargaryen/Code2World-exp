@@ -1,5 +1,0 @@
-{"t":69,"type":"coin_collected","coin_id":8,"x":-3.0551872842013834,"y":-0.24212673548609054}
-{"t":70,"type":"coin_collected","coin_id":3,"x":-3.224603281728924,"y":0.6874734152108424}
-{"t":125,"type":"coin_collected","coin_id":10,"x":0.8318191486410793,"y":1.6076165178790696}
-{"t":215,"type":"coin_collected","coin_id":7,"x":1.9330140491947532,"y":3.5353548627346747}
-{"t":300,"type":"terminate","reason":"time_limit"}

@@ -1,8 +1,0 @@
-==> 2026-06-17 19:44:34 <==
-# cmd: /mnt/pfs/users/huangzehuan/projects/linming/miniconda3/lib/python3.13/site-packages/conda/__main__.py create -y -p ./data_gen/.condalibs --override-channels -c conda-forge alsa-lib
-# conda version: 26.1.1
-+conda-forge/linux-64::_openmp_mutex-4.5-20_gnu
-+conda-forge/linux-64::alsa-lib-1.2.16.1-hb03c661_0
-+conda-forge/linux-64::libgcc-15.2.0-he0feb66_19
-+conda-forge/linux-64::libgomp-15.2.0-he0feb66_19
-# update specs: ['alsa-lib']
