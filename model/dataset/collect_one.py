@@ -56,7 +56,8 @@ def to64(obs):
 
 
 
-def collect_unpaired(env_name, n_episodes, max_actions, num_envs, action_repeat):
+def collect_unpaired(env_name, n_episodes, max_actions, num_envs, action_repeat,
+                     coinrun_config=None):
     """Per-frame actions from a per-env ActionStream. Buffers hold, per latent step,
     `action_repeat` frames and `action_repeat` per-frame actions. ep_a therefore ends
     with 4K per-frame actions. FLOW-ONLY: only frames + per-frame actions are stored;
@@ -65,7 +66,8 @@ def collect_unpaired(env_name, n_episodes, max_actions, num_envs, action_repeat)
     collect_single_scene."""
     from procgen import ProcgenEnv
     venv = ProcgenEnv(num_envs=num_envs, env_name=env_name,
-                      num_levels=0, start_level=0, distribution_mode="hard")
+                      num_levels=0, start_level=0, distribution_mode="hard",
+                      coinrun_config=coinrun_config)
     obs = venv.reset()["rgb"]
     rng = np.random.RandomState(0)
     streams = [ActionStream(np.random.RandomState(1000 + i)) for i in range(num_envs)]
@@ -120,7 +122,7 @@ def collect_unpaired(env_name, n_episodes, max_actions, num_envs, action_repeat)
 
 
 def collect_single_scene(env_name, n_episodes, max_actions, num_envs, action_repeat,
-                         level, stream_seed0):
+                         level, stream_seed0, coinrun_config=None):
     """Collect episodes that ALL start from the SAME fixed CoinRun level.
 
     CoinRun's vecenv auto-resets a done env to a NEW random level (num_levels=1 only
@@ -137,7 +139,8 @@ def collect_single_scene(env_name, n_episodes, max_actions, num_envs, action_rep
     batch = 0
     while len(out_f) < n_episodes:
         venv = ProcgenEnv(num_envs=num_envs, env_name=env_name, num_levels=1,
-                          start_level=int(level), distribution_mode="hard")
+                          start_level=int(level), distribution_mode="hard",
+                          coinrun_config=coinrun_config)
         obs = venv.reset()["rgb"]
         ep_f = [[obs[i].copy()] for i in range(num_envs)]
         ep_a = [[] for _ in range(num_envs)]
@@ -178,7 +181,7 @@ def collect_single_scene(env_name, n_episodes, max_actions, num_envs, action_rep
     return out_f[:n_episodes], out_a[:n_episodes]
 
 
-def collect_paired(env_name, seeds, max_actions, action_repeat):
+def collect_paired(env_name, seeds, max_actions, action_repeat, coinrun_config=None):
     """One episode per seed; replay the seed's deterministic PER-FRAME action stream.
     Each latent window = action_repeat frames (each its own action). A window
     containing a reset is dropped (episode ends at last complete latent). ep_a stores
@@ -188,7 +191,8 @@ def collect_paired(env_name, seeds, max_actions, action_repeat):
     out_f, out_a, out_seed = [], [], []
     for s in seeds:
         venv = ProcgenEnv(num_envs=1, env_name=env_name,
-                          num_levels=1, start_level=int(s), distribution_mode="hard")
+                          num_levels=1, start_level=int(s), distribution_mode="hard",
+                          coinrun_config=coinrun_config)
         obs = venv.reset()["rgb"]
         # deterministic per-frame action stream for the whole episode (frame-aligned)
         pf_actions = sample_actions_for_seed(s, max_actions * action_repeat)
@@ -266,6 +270,16 @@ def main():
                     help="--single-scene: #eval episodes (same scene, held-out action streams)")
     args = ap.parse_args()
 
+    # config-driven mechanics: load the YAML config into a coinrun_config dict that
+    # drives procgen at collection time (no recompile). Omitted config => vanilla.
+    coinrun_config = None
+    if args.config:
+        from game_config import load_config
+        cfg = load_config(args.config)
+        coinrun_config = cfg["coinrun_config"] or None
+        print(f"[{args.variant}] config {os.path.basename(args.config)} -> "
+              f"coinrun_config={coinrun_config}", flush=True)
+
     vdir = os.path.join(args.out, args.variant)
     os.makedirs(vdir, exist_ok=True)
     t0 = time.time()
@@ -278,11 +292,13 @@ def main():
         print(f"[{args.variant}] single-scene overfit: level={args.level} "
               f"action_repeat={ar} train={args.unpaired} eval={args.eval_unpaired}", flush=True)
         fs, as_ = collect_single_scene(args.env, args.unpaired, args.max_steps,
-                                       args.num_envs, ar, args.level, stream_seed0=1000)
+                                       args.num_envs, ar, args.level, stream_seed0=1000,
+                                       coinrun_config=coinrun_config)
         save_npz(os.path.join(vdir, "episodes_train.npz"), fs, as_, action_repeat=ar)
         # held-out action streams: seed range far from train's [1000, 1000+num_envs)
         fs, as_ = collect_single_scene(args.env, args.eval_unpaired, args.max_steps,
-                                       args.num_envs, ar, args.level, stream_seed0=900000)
+                                       args.num_envs, ar, args.level, stream_seed0=900000,
+                                       coinrun_config=coinrun_config)
         save_npz(os.path.join(vdir, "episodes_eval.npz"), fs, as_, action_repeat=ar)
         store_conditions(vdir, args)
         print(f"[{args.variant}] done in {time.time()-t0:.0f}s -> {vdir}", flush=True)
@@ -290,15 +306,18 @@ def main():
 
     print(f"[{args.variant}] collecting... (action_repeat={ar})", flush=True)
 
-    fs, as_ = collect_unpaired(args.env, args.unpaired, args.max_steps, args.num_envs, ar)
+    fs, as_ = collect_unpaired(args.env, args.unpaired, args.max_steps, args.num_envs, ar,
+                               coinrun_config=coinrun_config)
     save_npz(os.path.join(vdir, "episodes_train.npz"), fs, as_, action_repeat=ar)
 
     pseeds = list(range(args.paired_start, args.paired_start + args.paired_count))
-    fs, as_, sd = collect_paired(args.env, pseeds, args.max_steps, ar)
+    fs, as_, sd = collect_paired(args.env, pseeds, args.max_steps, ar,
+                                 coinrun_config=coinrun_config)
     save_npz(os.path.join(vdir, "episodes_paired.npz"), fs, as_, sd, action_repeat=ar)
 
     eseeds = list(range(args.eval_start, args.eval_start + args.eval_count))
-    fs, as_, sd = collect_paired(args.env, eseeds, args.max_steps, ar)
+    fs, as_, sd = collect_paired(args.env, eseeds, args.max_steps, ar,
+                                 coinrun_config=coinrun_config)
     save_npz(os.path.join(vdir, "episodes_eval.npz"), fs, as_, sd, action_repeat=ar)
 
     store_conditions(vdir, args)
