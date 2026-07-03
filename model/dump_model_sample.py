@@ -170,6 +170,40 @@ def main():
     with open(os.path.join(bundle, "meta.json"), "w") as f:
         json.dump(meta, f, indent=2)
 
+    # human-readable anatomy of this sample
+    readme = f"""# 一个训练 sample(模型视角): {tag}
+
+flow 模型训练时真实吃进去的一个 window,展示完整的 **code -> action -> frame** 闭环。
+用 config-driven 链路真实采集 + 真实预处理(Wan VAE encode + Qwen encode)得到。
+
+## 模型真正吃的 4 个张量(`model_input_tensors.pt`)
+
+| 张量 | shape | 是什么 |
+|---|---|---|
+| `latents` | {list(lat.shape)} | VAE latent 序列 = L 个 latent(1 latent = 4 帧) |
+| ├ init_latent[0] | {list(init_lat.shape)} | **initial frame** 的 latent,恒 clean 当条件,不预测 |
+| └ target_latents[1:] | {list(target_lat.shape)} | **target video**,模型要预测的 {L-1} 个 latent(后 {n_frames-1} 帧) |
+| `code` | {list(code.shape)} | **text/code condition** = Qwen 编码 `code_condition.txt` |
+| `act_pf` | {list(act_pf.shape)} | 逐帧 one-hot 动作,前 {R} 行=init 的 null |
+
+## 三种输入的可读形式
+
+- **text (code condition)** -> `code_condition.txt`(= `config.yaml`):CoinRun 的**完整游戏
+  说明书**(coinrun.cpp 的高可读 YAML 重写:world / player physics / level generation /
+  entities / collision / termination)。Qwen 读它 -> {int(code.shape[0])} token -> {list(code.shape)} embedding。
+  变体会在对应机制处标 [CHANGED]。`source.cpp` 是同一规则的源码形式(对照)。
+- **initial frame** -> `initial_frame.png`:episode 第 0 帧(玩家起点)。它的 latent = init_latent。
+- **actions** -> `actions.json`:{len(raw_actions)} 个逐帧动作(4 帧/latent),对齐 frames[1:]。
+  分段持续 2~8 帧、不对齐 latent -> 一个 latent 的 4 帧可能横跨动作切换。
+- **target video** -> `target_video.mp4` / `frames_grid.png`:模型要预测的画面(全 {n_frames} 帧)。
+
+## flow 训练目标
+对 target_latents 加噪 -> 模型在 code + act_pf 条件下预测 velocity v=z1-eps;
+init(latent[0])恒 clean 不算 loss。见 train_fm.py。
+"""
+    with open(os.path.join(bundle, "README.md"), "w") as f:
+        f.write(readme)
+
     print(f"saved model-sample bundle -> {bundle}/", flush=True)
     for k, v in meta["model_input_tensors"].items():
         print(f"  {k}: {v}", flush=True)
