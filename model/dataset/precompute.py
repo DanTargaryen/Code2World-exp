@@ -94,8 +94,6 @@ def precompute_latents(root, vae_path, variants, device):
             out = os.path.join(lat_dir, f"{v}__{split}.pt")
             torch.save({"latents": lat,                       # (sum(K+1), z, h, w) fp16
                         "actions": torch.from_numpy(d["actions"]),
-                        "rewards": torch.from_numpy(d["rewards"]),
-                        "dones": torch.from_numpy(d["dones"]),
                         "episode_lengths": torch.from_numpy(ep_lengths),
                         "action_repeat": ar,
                         "seeds": torch.from_numpy(d["seeds"]) if "seeds" in d else None},
