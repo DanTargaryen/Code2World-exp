@@ -1,0 +1,8 @@
+# CoinRun — faster horizontal movement.
+# Counterfactual: the player accelerates to a higher top speed. Same level layout
+# and action stream as base (given the same seed), so the trajectory diverges only
+# because of this rule change -> a clean code-sensitivity signal.
+name: fast
+game: coinrun
+mechanics:
+  max_speed: 0.9   # vanilla 0.5
