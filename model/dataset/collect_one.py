@@ -232,12 +232,24 @@ def save_npz(path, fs, as_, seeds=None, action_repeat=1):
           f"{len(flat_f)} frames, {len(flat_a)} per-frame actions, {mb:.0f}MB", flush=True)
 
 
+def store_conditions(vdir, args):
+    """Persist the code condition(s) into the variant dir: source.cpp always,
+    plus config.yaml when a --config is given (the declarative code condition the
+    text encoder reads via precompute --code-source yaml)."""
+    shutil.copy(args.src, os.path.join(vdir, "source.cpp"))
+    if args.config:
+        shutil.copy(args.config, os.path.join(vdir, "config.yaml"))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--variant", required=True)
     ap.add_argument("--env", default="coinrun")
     ap.add_argument("--out", required=True)              # dataset root
     ap.add_argument("--src", required=True)              # current coinrun.cpp (already modified)
+    ap.add_argument("--config", default=None,            # config.yaml = declarative code condition
+                    help="YAML config for this variant; stored as <out>/<variant>/config.yaml "
+                         "and fed to the text encoder (precompute --code-source yaml)")
     ap.add_argument("--unpaired", type=int, default=2200)
     ap.add_argument("--max-steps", type=int, default=60, help="max ACTIONS (latent steps) per episode")
     ap.add_argument("--action-repeat", type=int, default=4, help="env steps per action (frames/action)")
@@ -272,7 +284,7 @@ def main():
         fs, as_ = collect_single_scene(args.env, args.eval_unpaired, args.max_steps,
                                        args.num_envs, ar, args.level, stream_seed0=900000)
         save_npz(os.path.join(vdir, "episodes_eval.npz"), fs, as_, action_repeat=ar)
-        shutil.copy(args.src, os.path.join(vdir, "source.cpp"))
+        store_conditions(vdir, args)
         print(f"[{args.variant}] done in {time.time()-t0:.0f}s -> {vdir}", flush=True)
         return
 
@@ -289,7 +301,7 @@ def main():
     fs, as_, sd = collect_paired(args.env, eseeds, args.max_steps, ar)
     save_npz(os.path.join(vdir, "episodes_eval.npz"), fs, as_, sd, action_repeat=ar)
 
-    shutil.copy(args.src, os.path.join(vdir, "source.cpp"))
+    store_conditions(vdir, args)
     print(f"[{args.variant}] done in {time.time()-t0:.0f}s -> {vdir}", flush=True)
 
 

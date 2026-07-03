@@ -40,6 +40,12 @@ def main():
                    "--paired-count", str(args.paired_count),
                    "--eval-count", str(args.eval_count),
                    "--action-repeat", str(args.action_repeat)]
+            # if a declarative config exists for this variant, store it too (the
+            # config.yaml code condition fed to the text encoder). Falls back to
+            # source.cpp-only when absent.
+            cfg = os.path.join(HERE, "configs", f"{v}.yaml")
+            if os.path.exists(cfg):
+                cmd += ["--config", cfg]
             r = subprocess.run(cmd)
             if r.returncode != 0:
                 print(f"!! variant {v} failed (code {r.returncode})", flush=True)

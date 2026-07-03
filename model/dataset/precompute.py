@@ -102,20 +102,36 @@ def precompute_latents(root, vae_path, variants, device):
             print(f"  {v}/{split} [{mode}]: {lat.shape} -> {mb:.0f}MB ({time.time()-t0:.0f}s)", flush=True)
 
 
-def precompute_code(root, qwen_path, variants, device, max_len=5120):
+def precompute_code(root, qwen_path, variants, device, max_len=5120, code_source="yaml"):
+    """Encode each variant's code condition with a frozen Qwen text encoder.
+
+    code_source:
+      "yaml" -> feed <root>/<variant>/config.yaml (declarative rules; the
+                config-driven code condition). Falls back to source.cpp if the
+                YAML is absent (older datasets), with a warning.
+      "cpp"  -> feed <root>/<variant>/source.cpp (the raw coinrun.cpp variant).
+    """
     from transformers import AutoModel, AutoTokenizer
     os.environ["HF_HUB_OFFLINE"] = "1"
     tok = AutoTokenizer.from_pretrained(qwen_path)
     model = AutoModel.from_pretrained(qwen_path, torch_dtype=torch.float32).to(device).eval()
     embeds = {}
     for v in variants:
-        src_path = os.path.join(root, v, "source.cpp")
-        src = open(src_path).read()
-        ids = tok(src, return_tensors="pt", truncation=True, max_length=max_len).to(device)
+        yaml_path = os.path.join(root, v, "config.yaml")
+        cpp_path = os.path.join(root, v, "source.cpp")
+        if code_source == "yaml" and os.path.exists(yaml_path):
+            cond_path = yaml_path
+        elif code_source == "yaml":
+            print(f"  [warn] {v}: config.yaml missing, falling back to source.cpp", flush=True)
+            cond_path = cpp_path
+        else:
+            cond_path = cpp_path
+        text = open(cond_path).read()
+        ids = tok(text, return_tensors="pt", truncation=True, max_length=max_len).to(device)
         with torch.no_grad():
             out = model(**ids).last_hidden_state[0]  # (N_tok, 896)
         embeds[v] = out.half().cpu()
-        print(f"  code[{v}]: {tuple(embeds[v].shape)}", flush=True)
+        print(f"  code[{v}]: {tuple(embeds[v].shape)}  <- {os.path.basename(cond_path)}", flush=True)
     torch.save(embeds, os.path.join(root, "code_embeds.pt"))
     print(f"  saved code_embeds.pt", flush=True)
 
@@ -127,6 +143,9 @@ def main():
     ap.add_argument("--qwen", default="/mnt/pfs/users/huangzehuan/projects/linming/checkpoints/Qwen2.5-0.5B")
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--only", choices=["latents", "code", "both"], default="both")
+    ap.add_argument("--code-source", choices=["yaml", "cpp"], default="yaml",
+                    help="what to feed the text encoder as code condition "
+                         "(yaml=config.yaml, cpp=source.cpp; default yaml)")
     args = ap.parse_args()
 
     manifest = json.load(open(os.path.join(args.root, "variants.json")))
@@ -134,8 +153,8 @@ def main():
     print(f"variants: {variants}", flush=True)
 
     if args.only in ("code", "both"):
-        print("== precompute code embeds ==", flush=True)
-        precompute_code(args.root, args.qwen, variants, args.device)
+        print(f"== precompute code embeds (source={args.code_source}) ==", flush=True)
+        precompute_code(args.root, args.qwen, variants, args.device, code_source=args.code_source)
     if args.only in ("latents", "both"):
         print("== precompute latents ==", flush=True)
         precompute_latents(args.root, args.vae, variants, args.device)
