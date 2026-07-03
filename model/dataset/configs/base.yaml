@@ -1,5 +1,11 @@
-# CoinRun — vanilla mechanics (no overrides).
-# Every group omitted => reproduces the original coinrun.cpp frame-for-frame.
-# This YAML is the code condition the world model reads for the base variant.
+# CoinRun — vanilla mechanics.
+# This config is authored sparsely: any omitted mechanic uses its vanilla default
+# (so an empty config reproduces the original coinrun.cpp frame-for-frame).
+#
+# NOTE: the code condition fed to the text encoder is NOT this sparse file — it is
+# the FULL rendered rulebook (all 12 mechanics + descriptions, effective values),
+# produced by game_config.render_code_condition(). So even a short config yields a
+# complete, self-describing set of rules for the model to read. Overriding a
+# mechanic here just flips its value + marks it [CHANGED] in that rulebook.
 name: base
 game: coinrun

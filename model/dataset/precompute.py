@@ -106,11 +106,16 @@ def precompute_code(root, qwen_path, variants, device, max_len=5120, code_source
     """Encode each variant's code condition with a frozen Qwen text encoder.
 
     code_source:
-      "yaml" -> feed <root>/<variant>/config.yaml (declarative rules; the
-                config-driven code condition). Falls back to source.cpp if the
-                YAML is absent (older datasets), with a warning.
+      "yaml" -> the config-driven code condition. Loads <root>/<variant>/config.yaml
+                and renders the FULL rulebook (all mechanics + descriptions, sparse
+                configs expanded to effective values) via game_config, so the encoder
+                reads every rule. Falls back to source.cpp if the YAML is absent.
       "cpp"  -> feed <root>/<variant>/source.cpp (the raw coinrun.cpp variant).
     """
+    import sys
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from game_config import load_config, render_code_condition
+
     from transformers import AutoModel, AutoTokenizer
     os.environ["HF_HUB_OFFLINE"] = "1"
     tok = AutoTokenizer.from_pretrained(qwen_path)
@@ -120,18 +125,20 @@ def precompute_code(root, qwen_path, variants, device, max_len=5120, code_source
         yaml_path = os.path.join(root, v, "config.yaml")
         cpp_path = os.path.join(root, v, "source.cpp")
         if code_source == "yaml" and os.path.exists(yaml_path):
-            cond_path = yaml_path
+            text = render_code_condition(load_config(yaml_path))   # full rulebook
+            src = "config.yaml(full rules)"
         elif code_source == "yaml":
             print(f"  [warn] {v}: config.yaml missing, falling back to source.cpp", flush=True)
-            cond_path = cpp_path
+            text = open(cpp_path).read()
+            src = "source.cpp"
         else:
-            cond_path = cpp_path
-        text = open(cond_path).read()
+            text = open(cpp_path).read()
+            src = "source.cpp"
         ids = tok(text, return_tensors="pt", truncation=True, max_length=max_len).to(device)
         with torch.no_grad():
             out = model(**ids).last_hidden_state[0]  # (N_tok, 896)
         embeds[v] = out.half().cpu()
-        print(f"  code[{v}]: {tuple(embeds[v].shape)}  <- {os.path.basename(cond_path)}", flush=True)
+        print(f"  code[{v}]: {tuple(embeds[v].shape)}  <- {src}", flush=True)
     torch.save(embeds, os.path.join(root, "code_embeds.pt"))
     print(f"  saved code_embeds.pt", flush=True)
 

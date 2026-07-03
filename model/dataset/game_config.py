@@ -26,27 +26,28 @@ A flat `mechanics: {...}` block is also accepted (legacy) and merged in.
 import os
 import yaml
 
-# grouped schema: group -> {mechanic: (coinrun_option, type, vanilla_default)}
+# grouped schema: group -> {mechanic: (coinrun_option, type, vanilla_default, description)}
+# description is used to render the full code-condition text fed to the encoder.
 SCHEMA = {
     "physics": {
-        "gravity":     ("coinrun_gravity",     float, 0.2),
-        "max_jump":    ("coinrun_max_jump",    float, 1.5),
-        "max_speed":   ("coinrun_max_speed",   float, 0.5),
-        "air_control": ("coinrun_air_control", float, 0.15),
-        "mixrate":     ("coinrun_mixrate",     float, 0.2),
+        "gravity":     ("coinrun_gravity",     float, 0.2,  "downward acceleration applied each step; higher = falls faster"),
+        "max_jump":    ("coinrun_max_jump",    float, 1.5,  "upward jump impulse and vertical speed cap; higher = jumps higher"),
+        "max_speed":   ("coinrun_max_speed",   float, 0.5,  "maximum horizontal running speed"),
+        "air_control": ("coinrun_air_control", float, 0.15, "fraction of horizontal control retained while airborne (0=none, 1=full)"),
+        "mixrate":     ("coinrun_mixrate",     float, 0.2,  "how quickly horizontal velocity blends toward the target when grounded"),
     },
     "reward": {
-        "goal_reward": ("coinrun_goal_reward", float, 10.0),
+        "goal_reward": ("coinrun_goal_reward", float, 10.0, "reward granted when the player reaches the goal coin (ends the level)"),
     },
     "termination": {
-        "die_on_enemy": ("coinrun_die_on_enemy", bool, True),
-        "die_on_saw":   ("coinrun_die_on_saw",   bool, True),
-        "die_on_lava":  ("coinrun_die_on_lava",  bool, True),
+        "die_on_enemy": ("coinrun_die_on_enemy", bool, True, "touching a walking monster ends the episode (death)"),
+        "die_on_saw":   ("coinrun_die_on_saw",   bool, True, "touching a buzzsaw ends the episode (death)"),
+        "die_on_lava":  ("coinrun_die_on_lava",  bool, True, "touching lava ends the episode (death)"),
     },
     "hazards": {
-        "allow_pit":      ("coinrun_allow_pit",      bool, True),
-        "allow_crate":    ("coinrun_allow_crate",    bool, True),
-        "allow_monsters": ("coinrun_allow_monsters", bool, True),
+        "allow_pit":      ("coinrun_allow_pit",      bool, True, "level generation may carve pits (gaps with lava/saws/enemies at the bottom)"),
+        "allow_crate":    ("coinrun_allow_crate",    bool, True, "level generation may place stackable crates as obstacles/platforms"),
+        "allow_monsters": ("coinrun_allow_monsters", bool, True, "level generation may spawn moving monsters on the platforms"),
     },
 }
 
@@ -54,6 +55,7 @@ SCHEMA = {
 MECHANIC = {m: spec for grp in SCHEMA.values() for m, spec in grp.items()}
 MECHANIC_TO_OPTION = {m: spec[0] for m, spec in MECHANIC.items()}
 VANILLA = {m: spec[2] for m, spec in MECHANIC.items()}
+DESC = {m: spec[3] for m, spec in MECHANIC.items()}
 GROUP_OF = {m: g for g, grp in SCHEMA.items() for m in grp}
 
 
@@ -63,7 +65,7 @@ class ConfigError(ValueError):
 
 def _coerce(mech, value):
     """Cast value to the mechanic's declared type; raise ConfigError on mismatch."""
-    _, typ, _ = MECHANIC[mech]
+    typ = MECHANIC[mech][1]
     if typ is bool:
         if isinstance(value, bool):
             return value
@@ -123,14 +125,50 @@ def load_config(path):
         "game": game,
         "coinrun_config": coinrun_config,
         "mechanics": merged,
+        "overrides": set(incoming),   # which mechanics the config explicitly set
         "raw": raw,
     }
+
+
+def render_code_condition(cfg):
+    """Render the FULL game rules as the code condition fed to the text encoder.
+
+    A user config may be sparse (omitted mechanic => vanilla default), but the code
+    condition must be a COMPLETE rulebook so the encoder actually 'reads' every
+    mechanic — otherwise omitted rules carry no signal and code-sensitivity to them
+    is impossible. This expands the merged config (all 12 mechanics, effective
+    values) into a self-describing text: grouped, with each mechanic's value, its
+    meaning, and whether this variant overrides the vanilla default.
+
+    `cfg` is the dict returned by load_config.
+    """
+    merged = cfg["mechanics"]
+    overrides = cfg.get("overrides", set())
+    lines = [
+        f"# Game: CoinRun  (variant: {cfg['name']})",
+        "# A 2D platformer: run/jump rightward across procedurally generated terrain,",
+        "# avoid hazards, reach the goal coin. The rules below fully specify this",
+        "# variant's mechanics; values differing from vanilla are marked [CHANGED].",
+        "",
+    ]
+    for group, mechs in SCHEMA.items():
+        lines.append(f"[{group}]")
+        for mech, spec in mechs.items():
+            _, typ, default, desc = spec
+            val = merged[mech]
+            val_str = ("true" if val else "false") if typ is bool else f"{val:g}"
+            def_str = ("true" if default else "false") if typ is bool else f"{default:g}"
+            mark = f"  [CHANGED from {def_str}]" if mech in overrides else ""
+            lines.append(f"  {mech} = {val_str}  # {desc}{mark}")
+        lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
 
 
 if __name__ == "__main__":
     import sys
     for p in sys.argv[1:]:
         cfg = load_config(p)
-        print(f"[{cfg['name']}] game={cfg['game']}")
-        print(f"  overrides -> {cfg['coinrun_config']}")
-        print(f"  merged    -> {cfg['mechanics']}")
+        print(f"[{cfg['name']}] game={cfg['game']}  overrides={sorted(cfg['overrides'])}")
+        print("--- code condition (fed to text encoder) ---")
+        print(render_code_condition(cfg))
+

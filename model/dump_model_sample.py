@@ -19,6 +19,7 @@ import torch
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+sys.path.insert(0, os.path.join(HERE, "dataset"))
 from action_space import remap_to_compact
 
 ALABEL = {1: "left", 2: "left+jump", 4: "stay", 5: "jump", 7: "right", 8: "right+jump", 0: "noop"}
@@ -75,11 +76,12 @@ def main():
     frames = npz["frames"][f0: f0 + n_frames]              # (n_frames,64,64,3) u8
     raw_actions = npz["actions"][a0: a0 + (L - 1) * ar]    # (R*(L-1),) raw ids
 
-    # ---- text (code condition): config.yaml raw + Qwen embedding ----
+    # ---- text (code condition): FULL rendered rulebook (not the sparse yaml) ----
+    from game_config import load_config, render_code_condition
     from transformers import AutoModel, AutoTokenizer
     os.environ["HF_HUB_OFFLINE"] = "1"
     cfg_path = os.path.join(args.root, args.variant, "config.yaml")
-    cfg_text = open(cfg_path).read()
+    cfg_text = render_code_condition(load_config(cfg_path))   # exactly what precompute feeds
     tok = AutoTokenizer.from_pretrained(args.qwen)
     qwen = AutoModel.from_pretrained(args.qwen, torch_dtype=torch.float32).to(dev).eval()
     ids = tok(cfg_text, return_tensors="pt", truncation=True, max_length=5120).to(dev)
@@ -109,9 +111,12 @@ def main():
                 "raw_actions": torch.from_numpy(raw_actions)},
                os.path.join(bundle, "model_input_tensors.pt"))
 
-    # copies of the code condition (both forms)
+    # code condition forms: the sparse config the user wrote, the FULL rendered
+    # rulebook that is actually encoded, and the raw source.cpp for reference.
     import shutil
-    shutil.copy(cfg_path, os.path.join(bundle, "config.yaml"))
+    shutil.copy(cfg_path, os.path.join(bundle, "config.yaml"))          # sparse (user-authored)
+    with open(os.path.join(bundle, "code_condition.txt"), "w") as f:    # what Qwen encodes
+        f.write(cfg_text)
     src = os.path.join(args.root, args.variant, "source.cpp")
     if os.path.exists(src):
         shutil.copy(src, os.path.join(bundle, "source.cpp"))
