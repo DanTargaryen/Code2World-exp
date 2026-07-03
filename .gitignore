@@ -1,7 +1,8 @@
 # 训练/推理产物、日志、缓存(不进版本控制)
-# 所有日志统一落 logs/;rollout/训练产物落 outputs/(均本地,仓库根)
+# 所有日志统一落 logs/;rollout/训练产物落 outputs/;样本 bundle 落 examples/(均本地,仓库根)
 logs/
 outputs/
+examples/
 model/runs/
 **/__pycache__/
 *.log
