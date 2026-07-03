@@ -125,10 +125,72 @@ class CrossAttention(nn.Module):
         return self.proj(out)
 
 
-class DiTBlock(nn.Module):
-    def __init__(self, dim, num_heads, num_actions, mlp_ratio=4.0):
+class ActionWindowCrossAttention(nn.Module):
+    """Window-conditioned action injection (Matrix-Game style).
+
+    PER-FRAME actions: input is (B, vae_ratio*L, A) — vae_ratio (=4) per-frame
+    actions per latent. For latent i we gather the `window` latents' worth of
+    per-frame actions, i.e. vae_ratio*window raw-frame action embeds, concat them
+    into that latent's K/V. This is EXACTLY Matrix-Game's keyboard branch
+    (kv dim = act_hidden * vae_ratio * window). The visual tokens are the query,
+    attending over the temporal (latent) axis per spatial position, masked by the
+    block-causal `allow`. Output proj is zero-init (untrained block = identity).
+    """
+    def __init__(self, dim, num_heads, num_actions, window=3, vae_ratio=4, act_hidden=128):
         super().__init__()
-        self.action_proj = nn.Linear(num_actions, dim, bias=False)
+        self.num_heads = num_heads
+        self.window = window
+        self.vae_ratio = vae_ratio
+        self.act_embed = nn.Sequential(
+            nn.Linear(num_actions, act_hidden, bias=True), nn.SiLU(),
+            nn.Linear(act_hidden, act_hidden, bias=True))
+        self.q = nn.Linear(dim, dim)
+        self.kv = nn.Linear(act_hidden * vae_ratio * window, dim * 2)
+        self.q_norm = nn.LayerNorm(dim // num_heads)
+        self.k_norm = nn.LayerNorm(dim // num_heads)
+        self.proj = nn.Linear(dim, dim)
+        nn.init.zeros_(self.proj.weight); nn.init.zeros_(self.proj.bias)
+
+    def forward(self, x, action_pf, allow):
+        # x: (B,T,S,D)  action_pf: (B, R*T, A) per-frame one-hot (R=vae_ratio)
+        B, T, S, D = x.shape
+        nh, hd = self.num_heads, D // self.num_heads
+        R, W = self.vae_ratio, self.window
+        a = self.act_embed(action_pf)                          # (B, R*T, H)
+        H = a.shape[-1]
+        # left-pad R*(W-1) frames (repeat first frame) so latent 0 has a full window
+        a_pad = torch.cat([a[:, :1].expand(B, R * (W - 1), H), a], dim=1)  # (B, R*(T+W-1), H)
+        # latent i (0..T-1) gathers frames [R*i : R*(i+W)] -> R*W per-frame embeds
+        win = torch.stack([a_pad[:, R * i: R * (i + W)] for i in range(T)], dim=1)  # (B,T,R*W,H)
+        win = win.reshape(B, T, R * W * H)                     # (B, T, R*W*H)
+        kv = self.kv(win).reshape(B, T, 2, nh, hd)
+        k, v = kv.unbind(2)                                    # each (B,T,nh,hd)
+        q = self.q(x).reshape(B, T, S, nh, hd)
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+        # attend over time per spatial position: q (B,S,nh,T,hd) x k (B,S,nh,T,hd)
+        q = q.permute(0, 2, 3, 1, 4)                           # (B,S,nh,T,hd)
+        k = k.permute(0, 2, 1, 3).unsqueeze(1).expand(B, S, nh, T, hd)
+        v = v.permute(0, 2, 1, 3).unsqueeze(1).expand(B, S, nh, T, hd)
+        out = F.scaled_dot_product_attention(q, k, v, attn_mask=allow[None, None, None])
+        out = out.permute(0, 3, 1, 2, 4).reshape(B, T, S, D)   # (B,T,S,D)
+        return self.proj(out)
+
+
+class DiTBlock(nn.Module):
+    def __init__(self, dim, num_heads, num_actions, mlp_ratio=4.0,
+                 action_mode="bias", action_window=3, vae_ratio=4):
+        super().__init__()
+        self.action_mode = action_mode
+        self.vae_ratio = vae_ratio
+        if action_mode == "bias":
+            self.action_proj = nn.Linear(num_actions, dim, bias=False)
+        elif action_mode == "crossattn":
+            self.ln_act = nn.LayerNorm(dim)
+            self.action_cross = ActionWindowCrossAttention(
+                dim, num_heads, num_actions, window=action_window, vae_ratio=vae_ratio)
+        else:
+            raise ValueError(f"unknown action_mode {action_mode}")
         self.tau_proj = nn.Linear(dim, dim)            # injects timestep embedding
         nn.init.zeros_(self.tau_proj.weight); nn.init.zeros_(self.tau_proj.bias)
         self.ln_sp = nn.LayerNorm(dim)
@@ -141,12 +203,20 @@ class DiTBlock(nn.Module):
         hidden = int(dim * mlp_ratio)
         self.ff = nn.Sequential(nn.Linear(dim, hidden), nn.GELU(), nn.Linear(hidden, dim))
 
-    def forward(self, x, action_onehot, code, allow, code_mask=None, t_emb=None):
-        # action_onehot: (B, T, num_actions) -> bias (B, T, 1, D); t_emb: (B, T, D) or None
-        bias = self.action_proj(action_onehot)
-        if t_emb is not None:
-            bias = bias + self.tau_proj(t_emb)
-        x = x + bias.unsqueeze(2)
+    def forward(self, x, action_pf, code, allow, code_mask=None, t_emb=None):
+        # action_pf: (B, R*T, A) per-frame one-hot (R=vae_ratio); t_emb: (B, T, D) or None
+        if self.action_mode == "bias":
+            # collapse per-frame -> per-latent by taking each latent's LAST frame action
+            R = self.vae_ratio
+            act_latent = action_pf[:, R - 1::R]                  # (B, T, A)
+            bias = self.action_proj(act_latent)
+            if t_emb is not None:
+                bias = bias + self.tau_proj(t_emb)
+            x = x + bias.unsqueeze(2)
+        else:  # crossattn: per-frame window action as K/V, visual tokens as query
+            if t_emb is not None:
+                x = x + self.tau_proj(t_emb).unsqueeze(2)
+            x = x + self.action_cross(self.ln_act(x), action_pf, allow)
         x = x + self.spatial(self.ln_sp(x))
         x = x + self.temporal(self.ln_tp(x), allow)
         x = x + self.cross(self.ln_cr(x), code, code_mask)
@@ -157,7 +227,7 @@ class DiTBlock(nn.Module):
 class CausalDiT(nn.Module):
     def __init__(self, latent_dim=16, embed_dim=512, num_layers=12, num_heads=8,
                  num_actions=15, spatial_size=8, max_frames=64, code_dim=896,
-                 block_size=3):
+                 block_size=3, action_mode="bias", action_window=3, vae_ratio=4):
         super().__init__()
         self.spatial_size = spatial_size
         S = spatial_size * spatial_size
@@ -165,6 +235,8 @@ class CausalDiT(nn.Module):
         self.embed_dim = embed_dim
         self.latent_dim = latent_dim
         self.block_size = block_size
+        self.action_mode = action_mode
+        self.action_window = action_window
 
         # project frozen code-encoder embeds (e.g. Qwen, 896-d) into model width
         self.code_proj = (nn.Linear(code_dim, embed_dim)
@@ -176,7 +248,9 @@ class CausalDiT(nn.Module):
         self.temporal_pos = nn.Parameter(torch.zeros(1, max_frames, 1, embed_dim))
 
         self.blocks = nn.ModuleList([
-            DiTBlock(embed_dim, num_heads, num_actions) for _ in range(num_layers)])
+            DiTBlock(embed_dim, num_heads, num_actions,
+                     action_mode=action_mode, action_window=action_window, vae_ratio=vae_ratio)
+            for _ in range(num_layers)])
         self.ln_out = nn.LayerNorm(embed_dim)
         self.output_proj = nn.Linear(embed_dim, latent_dim)     # legacy MSE path
         self.flow_out = nn.Linear(embed_dim, latent_dim)        # velocity head
@@ -235,17 +309,18 @@ class CausalDiT(nn.Module):
 
 @torch.no_grad()
 def block_ar_generate(model, init_latent, actions, code, num_actions, dev,
-                      block_size, flow_steps, code_mask=None):
-    """Block-autoregressive rollout for the flow model.
+                      block_size, flow_steps, code_mask=None, vae_ratio=4):
+    """Block-autoregressive rollout for the flow model (PER-FRAME actions).
 
     init_latent: (1, 1, C, h, w) clean INIT latent (index 0).
-    actions:     length-K sequence; produces K latents -> total L = K+1 (<= max_frames).
-    Each AR step denoises the next block of latents (block 0 emits block_size-1
-    because the init fills one slot; later blocks emit block_size) jointly via Euler
-    integration from noise, with the clean history held at tau=1.
-    Returns the full latent sequence (1, K+1, C, h, w) including the init.
+    actions:     PER-FRAME sequence of length R*K (R=vae_ratio), producing K latents
+                 -> total L = K+1. Latent i (1..L-1) consumes actions[R*(i-1):R*i].
+    Each AR step denoises the next block of latents jointly via Euler integration from
+    noise, with the clean history held at tau=1. Returns (1, K+1, C, h, w) incl. init.
     """
-    L_target = len(actions) + 1
+    R = vae_ratio
+    K = len(actions) // R
+    L_target = K + 1
     hist = init_latent.clone()                                    # (1, 1, C, h, w) clean
     Cshape = init_latent.shape[2:]
     dt = 1.0 / flow_steps
@@ -254,9 +329,11 @@ def block_ar_generate(model, init_latent, actions, code, num_actions, dev,
         b = block_size - (cur % block_size) if (cur % block_size) else block_size
         b = min(b, L_target - cur)
         seqlen = cur + b
-        a_full = torch.zeros(1, seqlen, num_actions, device=dev)
+        # per-frame one-hot (1, R*seqlen, A); latent 0's R frames = null (all-zero)
+        a_full = torch.zeros(1, R * seqlen, num_actions, device=dev)
         for i in range(1, seqlen):
-            a_full[0, i, int(actions[i - 1])] = 1.0
+            for j in range(R):
+                a_full[0, R * i + j, int(actions[R * (i - 1) + j])] = 1.0
         z_block = torch.randn(1, b, *Cshape, device=dev)
         for s in range(flow_steps):
             seq = torch.cat([hist, z_block], dim=1)              # (1, seqlen, C, h, w)

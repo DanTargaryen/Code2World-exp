@@ -1,6 +1,10 @@
 """Code2World dataset: loads precomputed VAE latents + Qwen code embeds, samples
-T-frame windows. Each item = (latents, actions, rewards, dones, code) for one
+T-latent windows. Each item = (latents, actions, rewards, dones, code) for one
 window from one (variant, episode).
+
+PER-FRAME actions: an episode of K latents stores 4K per-frame actions (action_repeat
+frames per latent). A window of T latents therefore carries T+1 latents, T rewards/
+dones, and action_repeat*T per-frame actions (aligned to the window's frames[1:]).
 
 Splits:
   - train:  unpaired (episodes_train) + paired (episodes_paired) across all variants
@@ -16,7 +20,7 @@ class Code2WorldDataset(Dataset):
     def __init__(self, root, split="train", window=32, variants=None):
         """
         split: "train" -> episodes_train + episodes_paired ; "eval" -> episodes_eval
-        window: T frames per sample (input T + target T means T+1 latents).
+        window: T latents per sample (input T + target means T+1 latents).
         """
         self.root = root
         self.window = window
@@ -42,6 +46,12 @@ class Code2WorldDataset(Dataset):
                 if not os.path.exists(pt):
                     continue
                 d = torch.load(pt)
+                ar = int(d.get("action_repeat", 1))
+                # per-frame if actions count == action_repeat * total latent steps
+                n_lat_steps = int(d["episode_lengths"].sum())
+                self.per_frame = bool(d.get("per_frame_actions", False)) or \
+                    (len(d["actions"]) == ar * n_lat_steps and ar > 1)
+                self.action_repeat = ar if self.per_frame else 1
                 shard_id = len(self.shards)
                 self.shards.append({"variant": v,
                                     "latents": d["latents"],          # (Nframe, z, h, w) fp16
@@ -49,30 +59,35 @@ class Code2WorldDataset(Dataset):
                                     "rewards": d["rewards"],
                                     "dones": d["dones"]})
                 ep_len = d["episode_lengths"].tolist()
-                f_cursor = 0   # frames: each ep has len+1 frames
-                a_cursor = 0   # actions: each ep has len actions
+                f_cursor = 0   # latents: each ep has L+1 latents
+                s_cursor = 0   # per-latent scalars (rewards/dones): L per ep
+                a_cursor = 0   # actions: action_repeat*L per ep (per-frame) or L (legacy)
                 for L in ep_len:
-                    if L >= window:   # need at least `window` actions
-                        self.index.append((shard_id, f_cursor, a_cursor, L))
+                    if L >= window:   # need at least `window` latents
+                        self.index.append((shard_id, f_cursor, s_cursor, a_cursor, L))
                     f_cursor += L + 1
-                    a_cursor += L
+                    s_cursor += L
+                    a_cursor += L * self.action_repeat
 
     def __len__(self):
         return len(self.index)
 
     def __getitem__(self, i):
-        shard_id, f0, a0, L = self.index[i]
+        shard_id, f0, s0, a0, L = self.index[i]
         sh = self.shards[shard_id]
         T = self.window
-        # random window start within the episode
+        ar = self.action_repeat
+        # random window start within the episode (in latent steps)
         off = np.random.randint(0, L - T + 1)
         fs = f0 + off
-        as_ = a0 + off
-        lat = sh["latents"][fs: fs + T + 1].float()       # (T+1, z, h, w)
-        act = sh["actions"][as_: as_ + T].long()           # (T,)
-        rew = sh["rewards"][as_: as_ + T].float()
-        done = sh["dones"][as_: as_ + T].long()
-        code = self.code_embeds[sh["variant"]].float()     # (N_tok, 896)
+        lat = sh["latents"][fs: fs + T + 1].float()          # (T+1, z, h, w)
+        rew = sh["rewards"][s0 + off: s0 + off + T].float()  # (T,) per-latent
+        done = sh["dones"][s0 + off: s0 + off + T].long()
+        # actions: per-frame -> ar*T for this window (a0 already counts per-frame);
+        # per-latent (ar=1) -> T. Only the in-episode offset scales by ar.
+        as_ = a0 + off * ar
+        act = sh["actions"][as_: as_ + T * ar].long()        # (ar*T,) or (T,)
+        code = self.code_embeds[sh["variant"]].float()       # (N_tok, 896)
         return {"latents": lat, "actions": act, "rewards": rew,
                 "dones": done, "code": code, "variant": sh["variant"]}
 

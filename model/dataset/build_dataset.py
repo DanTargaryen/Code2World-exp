@@ -14,7 +14,7 @@ COINRUN = "/mnt/pfs/users/huangzehuan/projects/linming/workspace/procgen/procgen
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--out", default="/mnt/pfs/data/huangzehuan/datasets/code2world_act6_tc")
+    ap.add_argument("--out", default="/mnt/pfs/data/huangzehuan/datasets/code2world_act6_pf")
     ap.add_argument("--unpaired", type=int, default=2200)
     ap.add_argument("--paired-count", type=int, default=300)
     ap.add_argument("--eval-count", type=int, default=100)
