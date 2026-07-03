@@ -1,9 +1,9 @@
 """8-GPU DDP training for the per-frame code-conditioned Causal DiT flow model.
 
 Why a wrapper: DDP only hooks gradient sync inside forward(). Our flow training runs
-forward_flow + forward_state (two passes) and BYPASSES CausalDiT.forward(), so we wrap
-both passes + the full loss into FlowTrainWrapper.forward() and DDP-wrap THAT. The loss
-math is identical to train_fm.compute_loss (imported prep_batch keeps it in sync).
+forward_flow and BYPASSES CausalDiT.forward(), so we wrap the flow pass + loss into
+FlowTrainWrapper.forward() and DDP-wrap THAT. The loss math is identical to
+train_fm.compute_loss (imported prep_batch keeps it in sync).
 
 Launch (single node, 8 GPUs):
   torchrun --nproc_per_node=8 train_fm_ddp.py \
@@ -28,8 +28,8 @@ from train_fm import prep_batch, evaluate, dump_sample   # reuse identical loss/
 
 
 class FlowTrainWrapper(torch.nn.Module):
-    """Wrap forward_flow + forward_state + loss into ONE forward() so DDP syncs grads.
-    Mirrors train_fm.compute_loss exactly."""
+    """Wrap forward_flow + flow loss into ONE forward() so DDP syncs grads.
+    Mirrors train_fm.compute_loss exactly (flow objective only)."""
     def __init__(self, model, block_size, compact):
         super().__init__()
         self.model = model
@@ -37,7 +37,7 @@ class FlowTrainWrapper(torch.nn.Module):
         self.compact = compact
 
     def forward(self, batch, dev, num_actions):
-        lat, act_pf, reward_cls, done_cls, code, code_mask = prep_batch(
+        lat, act_pf, code, code_mask = prep_batch(
             batch, num_actions, dev, self.compact)
         B, L = lat.shape[:2]
         bs = self.block_size
@@ -53,13 +53,7 @@ class FlowTrainWrapper(torch.nn.Module):
         v_star = lat - eps
         v = self.model.forward_flow(z_tau, tau, act_pf, code, code_mask)
         loss_fm = F.mse_loss(v[:, 1:].float(), v_star[:, 1:])
-        rew_logits, done_logits = self.model.forward_state(lat, act_pf, code, code_mask)
-        loss_rew = F.cross_entropy(rew_logits.float().reshape(-1, 3),
-                                   reward_cls.reshape(-1), ignore_index=-100)
-        loss_done = F.cross_entropy(done_logits.float().reshape(-1, 2),
-                                    done_cls.reshape(-1), ignore_index=-100)
-        loss = loss_fm + 0.1 * loss_rew + 0.1 * loss_done
-        return loss, loss_fm.detach(), loss_rew.detach(), loss_done.detach()
+        return loss_fm, loss_fm.detach()
 
 
 def main():
@@ -150,7 +144,8 @@ def main():
     start_step = 0
     if args.resume and os.path.exists(args.resume):
         ck = torch.load(args.resume, map_location=dev)
-        model.load_state_dict(ck["model"]); opt.load_state_dict(ck["opt"])
+        model.load_state_dict(ck["model"], strict=False)  # tolerate old reward/done heads
+        opt.load_state_dict(ck["opt"])
         start_step = ck.get("step", 0)
         log(f"resumed from {args.resume} @ step {start_step}")
 
@@ -166,12 +161,12 @@ def main():
     vae = None
     model.train()
     t0 = time.time()
-    run = {"loss": 0.0, "fm": 0.0, "rew": 0.0, "done": 0.0, "n": 0}
+    run = {"fm": 0.0, "n": 0}
     for step in range(start_step, args.steps):
         for g in opt.param_groups:
             g["lr"] = lr_at(step)
         b = next(it)
-        loss, l_fm, l_rew, l_done = ddp(b, dev, args.num_actions)
+        loss, l_fm = ddp(b, dev, args.num_actions)
         opt.zero_grad(set_to_none=True)
         if scaler.is_enabled():
             scaler.scale(loss).backward()
@@ -183,22 +178,19 @@ def main():
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             opt.step()
 
-        run["loss"] += loss.item(); run["fm"] += l_fm.item()
-        run["rew"] += l_rew.item(); run["done"] += l_done.item(); run["n"] += 1
+        run["fm"] += l_fm.item(); run["n"] += 1
 
         if is_main and (step % args.log_every == 0 or step == args.steps - 1):
             n = max(run["n"], 1); dt = time.time() - t0
             ips = (step - start_step + 1) / max(dt, 1e-6)
-            log(f"step {step:6d} | lr {lr_at(step):.2e} | loss {run['loss']/n:.5f} "
-                f"(fm {run['fm']/n:.5f} rew {run['rew']/n:.3f} done {run['done']/n:.3f}) "
+            log(f"step {step:6d} | lr {lr_at(step):.2e} | fm {run['fm']/n:.5f} "
                 f"| {ips:.2f} it/s (x{world})")
-            run = {"loss": 0.0, "fm": 0.0, "rew": 0.0, "done": 0.0, "n": 0}
+            run = {"fm": 0.0, "n": 0}
 
         if is_main and step > 0 and step % args.eval_every == 0:
             ev = evaluate(model, eval_dl, args.num_actions, dev, amp_dtype, args.block_size,
                           compact=args.action_compact)
-            log(f"  [eval] loss {ev['loss']:.5f} (fm {ev['fm']:.5f} "
-                f"rew {ev['rew']:.3f} done {ev['done']:.3f})")
+            log(f"  [eval] fm {ev['fm']:.5f}")
             model.train()
 
         if is_main and step > 0 and step % args.sample_every == 0:

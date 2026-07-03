@@ -8,9 +8,7 @@ INDEPENDENT tau~U(0,1) and eps~N(0,I); the init latent (index 0) is held clean
 
   z_tau = (1-tau)*eps + tau*z1
   v     = forward_flow(z_tau, tau, action, code)          # per-latent velocity
-  L_fm  = || v - (z1 - eps) ||^2     over latents 1..L-1   # init excluded
-  state = forward_state(clean z1, ...) -> reward/done      # separate clean pass, tau-free
-  L     = L_fm + 0.1*CE(reward) + 0.1*CE(done)
+  L     = || v - (z1 - eps) ||^2     over latents 1..L-1   # init excluded; flow loss only
 
 action alignment: latent i (i>=1) is produced by action a[i-1]; sequence position 0
 (init) gets a null (all-zero) action.
@@ -50,7 +48,6 @@ def build_loaders(args):
 def prep_batch(batch, num_actions, dev, compact=False, vae_ratio=4):
     """Returns full-sequence tensors (L = window+1 latents).
       lat  (B,L,z,h,w)   act_pf (B, R*L, A)  latent-0 frames null (R=vae_ratio)
-      reward_cls/done_cls (B,L) long, pos0 = -100 (ignored by CE)
       code (B,N,Dc)      code_mask (B,N) bool
     PER-FRAME actions: batch["actions"] is (B, R*(L-1)) raw ids aligned to latent[1:].
     We prepend R null frames for the init latent -> (B, R*L, A). compact=True remaps
@@ -67,19 +64,13 @@ def prep_batch(batch, num_actions, dev, compact=False, vae_ratio=4):
         raise ValueError(f"action id {int(actions.max())} >= num_actions={num_actions}")
     act_pf = torch.zeros(B, R * L, num_actions, device=dev)
     act_pf[:, R:] = F.one_hot(actions, num_actions).float()           # latent-0 frames null
-    rewards = batch["rewards"].to(dev, non_blocking=True)             # (B, L-1)
-    dones = batch["dones"].to(dev, non_blocking=True)                 # (B, L-1)
-    reward_cls = torch.full((B, L), -100, dtype=torch.long, device=dev)
-    done_cls = torch.full((B, L), -100, dtype=torch.long, device=dev)
-    reward_cls[:, 1:] = (torch.sign(rewards) + 1).long()             # {0,1,2}
-    done_cls[:, 1:] = dones.long()                                    # {0,1}
     code = batch["code"].to(dev, non_blocking=True)
     code_mask = batch["code_mask"].to(dev, non_blocking=True)
-    return lat, act_pf, reward_cls, done_cls, code, code_mask
+    return lat, act_pf, code, code_mask
 
 
 def compute_loss(model, b, num_actions, dev, amp_dtype, block_size=3, compact=False):
-    lat, act_full, reward_cls, done_cls, code, code_mask = prep_batch(b, num_actions, dev, compact)
+    lat, act_full, code, code_mask = prep_batch(b, num_actions, dev, compact)
     B, L = lat.shape[:2]
     with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=amp_dtype is not None):
         # per-BLOCK independent noise level (all latents in a block share tau, matching
@@ -96,28 +87,21 @@ def compute_loss(model, b, num_actions, dev, amp_dtype, block_size=3, compact=Fa
         v_star = lat - eps
         v = model.forward_flow(z_tau, tau, act_full, code, code_mask)
         loss_fm = F.mse_loss(v[:, 1:].float(), v_star[:, 1:])         # exclude init
-        rew_logits, done_logits = model.forward_state(lat, act_full, code, code_mask)
-        loss_rew = F.cross_entropy(rew_logits.float().reshape(-1, 3),
-                                   reward_cls.reshape(-1), ignore_index=-100)
-        loss_done = F.cross_entropy(done_logits.float().reshape(-1, 2),
-                                    done_cls.reshape(-1), ignore_index=-100)
-    loss = loss_fm + 0.1 * loss_rew + 0.1 * loss_done
-    return loss, loss_fm.detach(), loss_rew.detach(), loss_done.detach()
+    return loss_fm, loss_fm.detach()
 
 
 @torch.no_grad()
 def evaluate(model, eval_dl, num_actions, dev, amp_dtype, block_size=3, max_batches=20, compact=False):
     model.eval()
-    tot = {"loss": 0.0, "fm": 0.0, "rew": 0.0, "done": 0.0, "n": 0}
+    tot = {"fm": 0.0, "n": 0}
     for i, b in enumerate(eval_dl):
         if i >= max_batches:
             break
-        loss, l_fm, l_rew, l_done = compute_loss(model, b, num_actions, dev, amp_dtype, block_size, compact)
-        tot["loss"] += loss.item(); tot["fm"] += l_fm.item()
-        tot["rew"] += l_rew.item(); tot["done"] += l_done.item(); tot["n"] += 1
+        _, l_fm = compute_loss(model, b, num_actions, dev, amp_dtype, block_size, compact)
+        tot["fm"] += l_fm.item(); tot["n"] += 1
     model.train()
     n = max(tot["n"], 1)
-    return {k: tot[k] / n for k in ("loss", "fm", "rew", "done")}
+    return {"fm": tot["fm"] / n}
 
 
 @torch.no_grad()
@@ -224,7 +208,8 @@ def main():
     start_step = 0
     if args.resume and os.path.exists(args.resume):
         ck = torch.load(args.resume, map_location=dev)
-        model.load_state_dict(ck["model"]); opt.load_state_dict(ck["opt"])
+        model.load_state_dict(ck["model"], strict=False)  # tolerate old reward/done heads
+        opt.load_state_dict(ck["opt"])
         start_step = ck.get("step", 0)
         print(f"resumed from {args.resume} @ step {start_step}", flush=True)
 
@@ -238,12 +223,12 @@ def main():
 
     model.train()
     t0 = time.time()
-    run = {"loss": 0.0, "fm": 0.0, "rew": 0.0, "done": 0.0, "n": 0}
+    run = {"fm": 0.0, "n": 0}
     for step in range(start_step, args.steps):
         for g in opt.param_groups:
             g["lr"] = lr_at(step)
         b = next(it)
-        loss, l_fm, l_rew, l_done = compute_loss(model, b, args.num_actions, dev, amp_dtype, args.block_size, args.action_compact)
+        loss, l_fm = compute_loss(model, b, args.num_actions, dev, amp_dtype, args.block_size, args.action_compact)
         opt.zero_grad(set_to_none=True)
         if scaler.is_enabled():
             scaler.scale(loss).backward()
@@ -255,22 +240,19 @@ def main():
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             opt.step()
 
-        run["loss"] += loss.item(); run["fm"] += l_fm.item()
-        run["rew"] += l_rew.item(); run["done"] += l_done.item(); run["n"] += 1
+        run["fm"] += l_fm.item(); run["n"] += 1
 
         if step % args.log_every == 0 or step == args.steps - 1:
             n = max(run["n"], 1); dt = time.time() - t0
             ips = (step - start_step + 1) / max(dt, 1e-6)
-            print(f"step {step:6d} | lr {lr_at(step):.2e} | loss {run['loss']/n:.5f} "
-                  f"(fm {run['fm']/n:.5f} rew {run['rew']/n:.3f} done {run['done']/n:.3f}) "
+            print(f"step {step:6d} | lr {lr_at(step):.2e} | fm {run['fm']/n:.5f} "
                   f"| {ips:.2f} it/s", flush=True)
-            run = {"loss": 0.0, "fm": 0.0, "rew": 0.0, "done": 0.0, "n": 0}
+            run = {"fm": 0.0, "n": 0}
 
         if step > 0 and step % args.eval_every == 0:
             ev = evaluate(model, eval_dl, args.num_actions, dev, amp_dtype, args.block_size,
                           compact=args.action_compact)
-            print(f"  [eval] loss {ev['loss']:.5f} (fm {ev['fm']:.5f} "
-                  f"rew {ev['rew']:.3f} done {ev['done']:.3f})", flush=True)
+            print(f"  [eval] fm {ev['fm']:.5f}", flush=True)
 
         if step > 0 and step % args.sample_every == 0:
             if vae is None:

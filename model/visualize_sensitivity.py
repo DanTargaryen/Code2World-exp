@@ -95,7 +95,8 @@ def main():
                       num_layers=ca.get("num_layers", 12), num_heads=ca.get("num_heads", 8),
                       num_actions=args.num_actions, spatial_size=8,
                       max_frames=ca.get("window", 32), code_dim=code_dim).to(dev)
-    model.load_state_dict(ck["model"]); model.eval()
+    # strict=False: old checkpoints carry removed reward/done head weights.
+    model.load_state_dict(ck["model"], strict=False); model.eval()
     vae = WanVAEWrapper(args.vae, device=dev)
     print(f"loaded model step {ck.get('step')}", flush=True)
 

@@ -66,7 +66,8 @@ def main():
                       num_actions=args.num_actions, spatial_size=h,
                       max_frames=cargs.get("window", 41) + 1, code_dim=code_dim,
                       block_size=cargs.get("block_size", 3)).to(dev)
-    model.load_state_dict(ck["model"])
+    # strict=False: old checkpoints carry removed reward/done head weights.
+    model.load_state_dict(ck["model"], strict=False)
     model.eval()
 
     codec = WanVAEWrapper(args.vae, device=dev)

@@ -64,7 +64,8 @@ def main():
                       block_size=cargs.get("block_size", args.block_size),
                       action_mode=cargs.get("action_mode", "bias"),
                       action_window=cargs.get("action_window", 3)).to(dev)
-    model.load_state_dict(ck["model"]); model.eval()
+    # strict=False: old checkpoints carry removed reward/done head weights.
+    model.load_state_dict(ck["model"], strict=False); model.eval()
     print(f"loaded {args.ckpt} (step {ck.get('step')})", flush=True)
 
     vae = WanVAEWrapper(args.vae, device=dev)

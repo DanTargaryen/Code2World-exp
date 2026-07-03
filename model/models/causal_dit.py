@@ -26,7 +26,9 @@ Two objectives share one backbone:
     Diffusion Forcing). Every latent carries its own noise level tau; the init is
     held clean (tau=1). No leak: same-block neighbours are only ever seen NOISED.
       forward_flow(z_tau, tau, action, code)    -> per-latent velocity v = z1 - eps
-      forward_state(clean_latents, action, code) -> reward/done logits (tau-free)
+
+Note: reward/done prediction was removed — the model now optimizes only the flow
+(velocity) objective.
 """
 import math
 import torch
@@ -260,10 +262,6 @@ class CausalDiT(nn.Module):
         self.tau_mlp = nn.Sequential(
             nn.Linear(embed_dim, embed_dim), nn.SiLU(), nn.Linear(embed_dim, embed_dim))
 
-        # auxiliary heads (per-latent: pool spatial tokens of the CLEAN pass)
-        self.reward_head = nn.Linear(embed_dim, 3)   # -1 / 0 / +1
-        self.done_head = nn.Linear(embed_dim, 2)
-
         nn.init.trunc_normal_(self.spatial_pos, std=0.02)
         nn.init.trunc_normal_(self.temporal_pos, std=0.02)
 
@@ -282,12 +280,11 @@ class CausalDiT(nn.Module):
 
     def forward(self, latents, action_onehot, code, code_mask=None):
         """LEGACY MSE path: per-latent causal, predict NEXT-frame latent.
-        returns pred (B,T,C,h,w), reward_logits (B,T,3), done_logits (B,T,2)."""
+        returns pred (B,T,C,h,w)."""
         B, T, C, h, w = latents.shape
         x = self._run_backbone(latents, action_onehot, code, code_mask, 1, None)
         pred = self.output_proj(x).reshape(B, T, h, w, C).permute(0, 1, 4, 2, 3)
-        pooled = x.mean(dim=2)
-        return pred, self.reward_head(pooled), self.done_head(pooled)
+        return pred
 
     def forward_flow(self, z_tau, tau, action_onehot, code, code_mask=None):
         """Block-AR flow: predict per-latent velocity v = z1 - eps.
@@ -298,13 +295,6 @@ class CausalDiT(nn.Module):
         t_emb = self.tau_mlp(timestep_embedding(tau, self.embed_dim))     # (B,L,D)
         x = self._run_backbone(z_tau, action_onehot, code, code_mask, self.block_size, t_emb)
         return self.flow_out(x).reshape(B, L, h, w, C).permute(0, 1, 4, 2, 3)
-
-    def forward_state(self, latents, action_onehot, code, code_mask=None):
-        """reward/done from a CLEAN, tau-free pass (per-latent causal).
-        returns reward_logits (B,L,3), done_logits (B,L,2)."""
-        x = self._run_backbone(latents, action_onehot, code, code_mask, 1, None)
-        pooled = x.mean(dim=2)
-        return self.reward_head(pooled), self.done_head(pooled)
 
 
 @torch.no_grad()
