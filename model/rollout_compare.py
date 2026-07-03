@@ -10,7 +10,6 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from models.causal_dit import CausalDiT, block_ar_generate
 from models.vae import WanVAEWrapper
-from models.pixel_codec import PixelCodec
 
 
 def to_u8(t):
@@ -51,19 +50,15 @@ def main():
     ap.add_argument("--scale", type=int, default=6, help="视频每帧放大倍数")
     ap.add_argument("--out", default="outputs/custom_rollout_fm")
     ap.add_argument("--device", default="cuda:0")
-    ap.add_argument("--pixel", action="store_true",
-                    help="pixel-space model: use PixelCodec (192-d 8x8 patch) not the VAE; "
-                         "latents file is <variant>__<split>_pixel.pt (1 latent==1 frame)")
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
     dev = args.device
-    tag = "_pixel" if args.pixel else ""
+    tag = ""
 
     # --- 模型 ---
     ck = torch.load(args.ckpt, map_location=dev)
     cargs = ck.get("args", {})
-    pixel = args.pixel
-    z, h = (192, 8) if pixel else (16, 8)
+    z, h = 16, 8
     code_bank = torch.load(os.path.join(args.root, "code_embeds.pt"), map_location="cpu")
     code_dim = next(iter(code_bank.values())).shape[1]
     model = CausalDiT(latent_dim=z, embed_dim=cargs.get("embed_dim", 512),
@@ -74,35 +69,18 @@ def main():
     model.load_state_dict(ck["model"])
     model.eval()
 
-    if pixel:
-        codec = PixelCodec(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], device=dev)
-    else:
-        codec = WanVAEWrapper(args.vae, device=dev)
+    codec = WanVAEWrapper(args.vae, device=dev)
 
     # --- 定位 episode 的 GT latent 与动作 ---
-    if pixel:
-        # pixel path: GT from raw frames; 1 latent == 1 frame; action_repeat maps 4 frames/action
-        d = np.load(os.path.join(args.root, args.variant, f"{args.split}.npz"))
-        epl = d["episode_lengths"]
-        ar = int(d["action_repeat"]) if "action_repeat" in d else 1
-        f0 = int(sum(ar * int(k) + 1 for k in epl[:args.ep]))   # frame start of ep
-        K = int(epl[args.ep])
-        nfr_ep = ar * K + 1
-        Ltot = min(nfr_ep, args.max_latents)                    # frames == latent steps
-        frames_np = d["frames"][f0:f0 + Ltot]                   # (Ltot,H,W,3) uint8
-        gt_frames_in = torch.from_numpy(frames_np.astype(np.float32) / 255.0).permute(0, 3, 1, 2)
-        gt_lat = codec.encode_frames(gt_frames_in).cpu()        # (Ltot,192,8,8)
-        actions = np.array([d["actions"][(i - 1) // ar] for i in range(1, Ltot)], np.int64)
-    else:
-        lat_all = torch.load(os.path.join(args.root, "latents", f"{args.variant}__{args.split}.pt"),
-                             map_location="cpu")
-        epl = lat_all["episode_lengths"].numpy()          # 每 ep 的 K(动作数),latent 数 = K+1
-        l0 = int(epl[:args.ep].sum()) + args.ep            # 该 ep 起始 latent 下标(每 ep 多 1 个 init)
-        a0 = int(epl[:args.ep].sum())                      # 该 ep 起始 action 下标
-        K = int(epl[args.ep])
-        Ltot = min(K + 1, args.max_latents)                # 实际用的 latent 数(含 init)
-        gt_lat = lat_all["latents"][l0:l0 + Ltot].float()  # (Ltot, z, h, w)
-        actions = lat_all["actions"][a0:a0 + (Ltot - 1)].numpy()   # (Ltot-1,)
+    lat_all = torch.load(os.path.join(args.root, "latents", f"{args.variant}__{args.split}.pt"),
+                         map_location="cpu")
+    epl = lat_all["episode_lengths"].numpy()          # 每 ep 的 K(动作数),latent 数 = K+1
+    l0 = int(epl[:args.ep].sum()) + args.ep            # 该 ep 起始 latent 下标(每 ep 多 1 个 init)
+    a0 = int(epl[:args.ep].sum())                      # 该 ep 起始 action 下标
+    K = int(epl[args.ep])
+    Ltot = min(K + 1, args.max_latents)                # 实际用的 latent 数(含 init)
+    gt_lat = lat_all["latents"][l0:l0 + Ltot].float()  # (Ltot, z, h, w)
+    actions = lat_all["actions"][a0:a0 + (Ltot - 1)].numpy()   # (Ltot-1,)
     code = code_bank[args.variant].float().unsqueeze(0).to(dev)
     init = gt_lat[:1].unsqueeze(0).to(dev)             # (1,1,z,h,w) 只喂 init
 
@@ -111,7 +89,7 @@ def main():
                                 cargs.get("block_size", 3), args.flow_steps)[0].cpu()  # (Ltot,z,h,w)
     assert gen_lat.shape[0] == Ltot, f"gen {gen_lat.shape[0]} != Ltot {Ltot}"
 
-    # --- 解码全部帧(pixel: 1 latent->1 帧; vae: 时间维展开 4x) ---
+    # --- 解码全部帧(vae 时间维展开 4x:1 latent -> 4 帧) ---
     gt_frames = codec.decode_video(gt_lat.to(dev))
     gen_frames = codec.decode_video(gen_lat.to(dev))
     nfr = gt_frames.shape[0]
@@ -133,7 +111,7 @@ def main():
     # --- 概览 grid(每 latent 取代表帧,上 GT 下 gen) ---
     ALABEL = {1: "L", 2: "L+U", 4: "STAY", 5: "UP", 7: "R", 8: "R+U"}
     labels = ["init"] + [ALABEL.get(int(a), str(int(a))) for a in actions]
-    frames_per_lat = 1 if pixel else 4          # pixel: 1 latent==1 帧; vae: 时间 4x
+    frames_per_lat = 4                          # vae 时间维 4x 展开(1 latent -> 4 帧)
     s = 4; W = 64 * s; per_row = 8; tiles = []
     for li in range(Ltot):
         fi = 0 if li == 0 else frames_per_lat * (li - 1) + 1

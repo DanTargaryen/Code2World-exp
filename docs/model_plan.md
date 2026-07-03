@@ -234,14 +234,18 @@ workspace/Code2world/model/
 | Step 5 | 评估 (action following + rollout + code sensitivity) | 1h | Step 4 |
 | **总计** | | **~1-2 天** | |
 
-## 9. 与 Code2world 既有代码的关系
+## 9. 数据源:Procgen CoinRun(单一路线）
 
-| Code2world (data_gen) | 本模块 (model) | 最终汇合 |
-|------------------------|----------------|---------|
-| three.js 游戏 → 帧/状态/事件 | Procgen → 帧/action/reward | 两条数据源 |
-| source.js = code condition | coinrun.cpp = code condition | 统一 cross-attn 通路（都是真实可执行代码） |
-| 反事实 config 变体 | 规则扰动 (code perturbation) | 统一 code sensitivity 评估 |
-| verify.mjs 确定性自检 | evaluate.py 模型评估 | 数据→模型验证链 |
+> 早期曾有 `data_gen` 的 three.js 平替玩具(`coin_collection` + playwright 渲染),
+> 现已删除。code condition 统一走原版 Procgen(`workspace/procgen`)CoinRun,
+> 与模型实际训练/评估的数据源一致,信号最纯。
+
+| 环节 | 实现 |
+|------|------|
+| 帧/action/reward | Procgen CoinRun(`coinrun.cpp` 确定性模拟器) |
+| code condition | `coinrun.cpp` 源码(经 Qwen 编码,真实可执行代码) |
+| 规则扰动 | code perturbation(改源码机制 → code sensitivity) |
+| 模型评估 | `eval_code_sensitivity.py` / `rollout_*.py` |
 
 ## 10. 关键依赖
 
