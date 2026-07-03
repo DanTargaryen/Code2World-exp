@@ -34,7 +34,7 @@ def main():
     ap.add_argument("--num_actions", type=int, default=9)
     ap.add_argument("--n_actions", type=int, default=41, help="latent steps to generate (->10s @16fps)")
     ap.add_argument("--fps", type=int, default=16)
-    ap.add_argument("--out", default="outputs/custom_rollout_fm")
+    ap.add_argument("--out", default="../outputs/custom_rollout_fm")
     ap.add_argument("--device", default="cuda:0")
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)

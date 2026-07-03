@@ -45,7 +45,7 @@ def main():
     ap.add_argument("--ep", type=int, default=0)
     ap.add_argument("--context", type=int, default=32)
     ap.add_argument("--num_actions", type=int, default=9)
-    ap.add_argument("--out", default="outputs/custom_rollout")
+    ap.add_argument("--out", default="../outputs/custom_rollout")
     ap.add_argument("--scale", type=int, default=4)
     ap.add_argument("--device", default="cuda:0")
     args = ap.parse_args()
