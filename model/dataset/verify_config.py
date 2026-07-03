@@ -67,13 +67,26 @@ def main():
     base2 = rollout_md5(cfg("base"))
     print(f"  MATCH       : {'PASS ✓' if base == base2 else 'FAIL ✗'}")
 
-    print("== 3. COUNTERFACTUAL: base vs fast / lowgrav ==")
-    fast = rollout_md5(cfg("fast"))
-    lowgrav = rollout_md5(cfg("lowgrav"))
-    print(f"  fast    differs from base: {'PASS ✓' if fast != base else 'FAIL ✗'}")
-    print(f"  lowgrav differs from base: {'PASS ✓' if lowgrav != base else 'FAIL ✗'}")
+    print("== 3. COUNTERFACTUAL: base vs mechanic overrides ==")
+    # physics (P0) + hazards (P2) change level layout/trajectory -> frames differ.
+    checks = {
+        "fast (max_speed)":  rollout_md5(cfg("fast")),
+        "lowgrav (gravity)": rollout_md5(cfg("lowgrav")),
+        "no_hazards (P2)":   rollout_md5(cfg("no_hazards")),
+    }
+    all_diff = True
+    for label, h in checks.items():
+        diff = h != base
+        all_diff &= diff
+        print(f"  {label:22s} differs from base: {'PASS ✓' if diff else 'FAIL ✗'}")
+    # P1 (invincible / die_on_*): only visible when the agent actually contacts a
+    # hazard, which a fixed 120-step action stream may not do -> not asserted here,
+    # just reported. Real effect shows in longer/goal-seeking rollouts.
+    inv = rollout_md5(cfg("invincible"))
+    print(f"  invincible (P1)        differs from base: "
+          f"{'yes' if inv != base else 'no (no hazard contact in this rollout)'}  [not asserted]")
 
-    ok = (vanilla == base) and (base == base2) and (fast != base) and (lowgrav != base)
+    ok = (vanilla == base) and (base == base2) and all_diff
     print("\nRESULT:", "ALL PASS ✓" if ok else "SOME FAILED ✗")
     sys.exit(0 if ok else 1)
 

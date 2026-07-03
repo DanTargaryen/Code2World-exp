@@ -3,5 +3,5 @@
 # fall speed while layout/actions stay fixed under a shared seed.
 name: lowgrav
 game: coinrun
-mechanics:
+physics:
   gravity: 0.1   # vanilla 0.2

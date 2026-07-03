@@ -4,5 +4,5 @@
 # because of this rule change -> a clean code-sensitivity signal.
 name: fast
 game: coinrun
-mechanics:
+physics:
   max_speed: 0.9   # vanilla 0.5

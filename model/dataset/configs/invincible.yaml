@@ -1,0 +1,10 @@
+# CoinRun — hazards still spawn, but none are lethal (P1).
+# Enemies/saws/lava are generated and visible, but touching them no longer ends
+# the episode. Same layout as base; the difference is purely in the death rules
+# -> isolates "what kills you" as a code-sensitivity dimension.
+name: invincible
+game: coinrun
+termination:
+  die_on_enemy: false
+  die_on_saw: false
+  die_on_lava: false

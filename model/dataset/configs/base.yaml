@@ -1,6 +1,5 @@
 # CoinRun — vanilla mechanics (no overrides).
-# An empty `mechanics` block reproduces the original coinrun.cpp frame-for-frame.
+# Every group omitted => reproduces the original coinrun.cpp frame-for-frame.
 # This YAML is the code condition the world model reads for the base variant.
 name: base
 game: coinrun
-mechanics: {}

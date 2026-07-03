@@ -1,0 +1,10 @@
+# CoinRun — no hazards generated (P2).
+# Level generation skips pits, crates and moving monsters, leaving clean platforms
+# + the goal coin. Terrain/jumps still present. Tests whether the model reads the
+# "which hazards exist" part of the rules.
+name: no_hazards
+game: coinrun
+hazards:
+  allow_pit: false
+  allow_crate: false
+  allow_monsters: false
