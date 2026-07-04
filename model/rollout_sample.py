@@ -8,7 +8,7 @@ decodes both to RGB, writes a stacked GT|gen image.
     python rollout_sample.py \
       --ckpt <...>/ckpt_final.pt --root <dataset> --out ../examples/rollout_final.png
 """
-import os, sys, argparse
+import os, sys, argparse, subprocess
 import numpy as np
 import torch
 import cv2
@@ -27,6 +27,23 @@ def to_u8(t):
     return (t.permute(1, 2, 0).clamp(0, 1).cpu().numpy() * 255).astype(np.uint8)
 
 
+def save_video(frames, path, fps, scale):
+    """frames: list of (H,W,3) uint8 -> mp4 via ffmpeg (nearest-neighbor upscaled)."""
+    import imageio_ffmpeg
+    ff = imageio_ffmpeg.get_ffmpeg_exe()
+    H, W = frames[0].shape[:2]
+    OH, OW = H * scale, W * scale
+    p = subprocess.Popen(
+        [ff, "-y", "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{OW}x{OH}",
+         "-r", str(fps), "-i", "-", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+         "-crf", "16", path],
+        stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    for f in frames:
+        img = cv2.resize(f, (OW, OH), interpolation=cv2.INTER_NEAREST)
+        p.stdin.write(np.ascontiguousarray(img, np.uint8).tobytes())
+    p.stdin.close(); p.wait()
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", required=True)
@@ -36,11 +53,14 @@ def main():
     ap.add_argument("--window", type=int, default=20)
     ap.add_argument("--n_latents", type=int, default=21, help="how many latents to roll out & show")
     ap.add_argument("--flow_steps", type=int, default=16)
-    ap.add_argument("--out", default="../examples/rollout_final.png")
+    ap.add_argument("--out", default="../examples/rollout_final",
+                    help="output dir; writes video.mp4 + grid.png")
+    ap.add_argument("--fps", type=int, default=8)
+    ap.add_argument("--scale", type=int, default=6, help="video upscale factor")
     ap.add_argument("--device", default="cuda:0")
     args = ap.parse_args()
     dev = args.device
-    os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
+    os.makedirs(args.out, exist_ok=True)
 
     ck = torch.load(args.ckpt, map_location=dev)
     ca = ck.get("args", {})
@@ -79,7 +99,18 @@ def main():
     gen_fr = vae.decode_video(gen[:K])
     nfr = gt_fr.shape[0]
 
-    # grid: one tile per latent (representative frame), top=GT / bottom=gen, action label
+    # --- video: per-frame [GT | gen] side-by-side ---
+    sbs = []
+    for i in range(nfr):
+        g = to_u8(gt_fr[i]); p = to_u8(gen_fr[i])
+        sep = np.ones((g.shape[0], 2, 3), np.uint8) * 255
+        sbs.append(np.concatenate([g, sep, p], axis=1))        # left GT | right gen
+    mp4 = os.path.join(args.out, "video.mp4")
+    save_video(sbs, mp4, args.fps, args.scale)
+    print(f"saved rollout video ({nfr} frames, {nfr/args.fps:.1f}s @ {args.fps}fps, "
+          f"left=GT right=gen) -> {mp4}", flush=True)
+
+    # --- grid: one tile per latent (representative frame), top=GT / bottom=gen ---
     s = 3; W = 64 * s; per_row = 7; tiles = []
     for li in range(K):
         fi = min(0 if li == 0 else 4 * (li - 1) + 1, nfr - 1)
@@ -94,8 +125,9 @@ def main():
     while len(tiles) % per_row:
         tiles.append(np.zeros_like(tiles[0]))
     rows = [np.concatenate(tiles[r:r + per_row], 1) for r in range(0, len(tiles), per_row)]
-    cv2.imwrite(args.out, cv2.cvtColor(np.concatenate(rows, 0), cv2.COLOR_RGB2BGR))
-    print(f"saved rollout grid ({K} latents, per tile: top=GT / bottom=gen) -> {args.out}", flush=True)
+    grid = os.path.join(args.out, "grid.png")
+    cv2.imwrite(grid, cv2.cvtColor(np.concatenate(rows, 0), cv2.COLOR_RGB2BGR))
+    print(f"saved rollout grid ({K} latents, per tile: top=GT / bottom=gen) -> {grid}", flush=True)
 
 
 if __name__ == "__main__":
