@@ -51,6 +51,7 @@ def main():
     ap.add_argument("--vae", default="/mnt/pfs/users/huangzehuan/projects/linming/checkpoints/FastVideo/Wan2.1-VSA-T2V-14B-720P-Diffusers")
     ap.add_argument("--variant", default="base")
     ap.add_argument("--window", type=int, default=20)
+    ap.add_argument("--ep", type=int, default=0, help="which eval episode to roll out")
     ap.add_argument("--n_latents", type=int, default=21, help="how many latents to roll out & show")
     ap.add_argument("--flow_steps", type=int, default=16)
     ap.add_argument("--out", default="../examples/rollout_final",
@@ -84,15 +85,22 @@ def main():
 
     vae = WanVAEWrapper(args.vae, device=dev)
 
-    # one eval clip: init latent + GT per-frame actions
-    b = collate([eval_ds[0]])
-    lat = b["latents"][0].to(dev)                              # (L, z, h, w)
-    raw_actions = b["actions"][0].cpu().numpy()                # (R*(L-1),) raw ids
+    # locate a SPECIFIC eval episode (args.ep) in the precomputed latents (not the
+    # dataset's random-window sampler), so --ep picks a deterministic clip.
+    lat_all = torch.load(os.path.join(args.root, "latents", f"{args.variant}__episodes_eval.pt"),
+                         map_location="cpu")
+    epl = lat_all["episode_lengths"].numpy()
+    R = int(lat_all.get("action_repeat", 4))
+    l0 = int(epl[:args.ep].sum()) + args.ep                    # latent start (each ep has K+1)
+    a0 = int(epl[:args.ep].sum()) * R                          # action start (R*K per ep)
+    K_ep = int(epl[args.ep])
+    K = min(args.n_latents, K_ep + 1)                          # latents to roll out (incl init)
+    lat = lat_all["latents"][l0: l0 + K].float().to(dev)      # (K, z, h, w)
+    raw_actions = lat_all["actions"][a0: a0 + (K - 1) * R].numpy()   # (R*(K-1),) raw ids
     acts = remap_to_compact(torch.as_tensor(raw_actions)).numpy() if compact else raw_actions
-    code = b["code"][:1].to(dev)
+    code = eval_ds.code_embeds[args.variant].float().unsqueeze(0).to(dev)   # (1, N, Dc)
     init = lat[:1].unsqueeze(0)                                # (1,1,z,h,w)
-    K = min(args.n_latents, lat.shape[0])
-    gen = block_ar_generate(model, init, acts[: (K - 1) * 4], code, num_actions, dev,
+    gen = block_ar_generate(model, init, acts, code, num_actions, dev,
                             block_size, args.flow_steps)[0]    # (K, z, h, w)
 
     gt_fr = vae.decode_video(lat[:K])                          # (4*(K-1)+1, 3, H, W)
