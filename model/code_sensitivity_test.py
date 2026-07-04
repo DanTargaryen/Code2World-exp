@@ -117,20 +117,46 @@ def main():
             cv2.putText(im, txt, (4, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1, cv2.LINE_AA)
             out.append(im)
         return out
-    rows_by_frame = [label_row(gt_fr, "GT")] + [label_row(gens[n], n) for n in args.configs]
-    ff = __import__("imageio_ffmpeg").get_ffmpeg_exe()
+    # ---- 1) base alone (single video) ----
+    base_name = args.configs[0]
     H = 64 * args.scale
-    stacked_w = H; stacked_h = H * len(rows_by_frame)
-    p = subprocess.Popen([ff, "-y", "-f", "rawvideo", "-pix_fmt", "rgb24",
-                          "-s", f"{stacked_w}x{stacked_h}", "-r", str(args.fps), "-i", "-",
-                          "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "16",
-                          os.path.join(args.out, "compare.mp4")],
-                         stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    for i in range(nfr):
-        col = np.concatenate([rows_by_frame[r][i] for r in range(len(rows_by_frame))], axis=0)
-        p.stdin.write(np.ascontiguousarray(col, np.uint8).tobytes())
-    p.stdin.close(); p.wait()
-    print(f"saved {args.out}/compare.mp4 (rows: GT + {', '.join(args.configs)})", flush=True)
+    ff = __import__("imageio_ffmpeg").get_ffmpeg_exe()
+
+    def write_video(path, per_frame_imgs, w, h):
+        p = subprocess.Popen([ff, "-y", "-f", "rawvideo", "-pix_fmt", "rgb24",
+                              "-s", f"{w}x{h}", "-r", str(args.fps), "-i", "-",
+                              "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "16", path],
+                             stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        for im in per_frame_imgs:
+            p.stdin.write(np.ascontiguousarray(im, np.uint8).tobytes())
+        p.stdin.close(); p.wait()
+
+    base_row = label_row(gens[base_name], base_name)
+    write_video(os.path.join(args.out, "base.mp4"), base_row, H, H)
+    print(f"saved {args.out}/base.mp4 ({base_name} alone)", flush=True)
+
+    # ---- 2) 3x2 grid comparison: GT + up to 5 variants (6 tiles) ----
+    tiles = ["GT"] + list(args.configs)          # GT then base, lowgrav, ...
+    tiles = tiles[:6]                            # 3x2 holds 6
+    tile_rows = {"GT": label_row(gt_fr, "GT")}
+    for n in args.configs:
+        tile_rows[n] = label_row(gens[n], n)
+    ncol, nrow = 3, 2
+    grid_w, grid_h = H * ncol, H * nrow
+    blank = np.zeros((H, H, 3), np.uint8)
+
+    def grid_frame(i):
+        cells = []
+        for t in tiles:
+            cells.append(tile_rows[t][i])
+        while len(cells) < ncol * nrow:
+            cells.append(blank)
+        rows = [np.concatenate(cells[r * ncol:(r + 1) * ncol], axis=1) for r in range(nrow)]
+        return np.concatenate(rows, axis=0)
+
+    write_video(os.path.join(args.out, "compare_3x2.mp4"), (grid_frame(i) for i in range(nfr)),
+                grid_w, grid_h)
+    print(f"saved {args.out}/compare_3x2.mp4 (3x2: {', '.join(tiles)})", flush=True)
 
 
 if __name__ == "__main__":
