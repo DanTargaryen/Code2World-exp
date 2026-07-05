@@ -55,6 +55,7 @@ def main():
     ap.add_argument("--fps", type=int, default=8)
     ap.add_argument("--scale", type=int, default=6)
     ap.add_argument("--out", default="../examples/code_sensitivity")
+    ap.add_argument("--seed", type=int, default=0, help="fixed seed for flow sampling noise (reproducible)")
     ap.add_argument("--device", default="cuda:0")
     args = ap.parse_args()
     dev = args.device
@@ -99,6 +100,7 @@ def main():
     gens, base_frames = {}, None
     print(f"ep={args.ep} K={K} | ckpt trained on '{args.train_variant}' only (counterfactuals are OOD)", flush=True)
     for name in args.configs:
+        torch.manual_seed(args.seed)   # SAME sampling noise per variant -> diff is purely from code
         code = encode_code(name, qwen, tok, dev)
         gen = block_ar_generate(model, init, acts, code, num_actions, dev, block_size, args.flow_steps)[0]
         fr = vae.decode_video(gen[:K])

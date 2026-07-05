@@ -168,3 +168,31 @@ CUDA_VISIBLE_DEVICES=0 python -u train_fm.py --root <pf_root> \
   --action_mode crossattn --action_window 3 --action_compact \
   --out <ckpt_dir> > ../logs/train_pf.log 2>&1 &
 ```
+
+## 9. 产物规范(生成/评估结果的硬性约定)
+
+**① 产物一律是 video(mp4)**,不要只出静态图。可附带 grid.png 作静态速览,但主产物是 mp4
+(逐帧 [GT | gen] 或多变体网格)。所有产物落 `examples/<有意义的名字>/`(本地,gitignore)。
+
+**② 规范命名 + 元信息**。每个产物目录名和/或同目录的 `README.txt` 必须写清生成配置,便于复现:
+- **权重**:`<变体>-<step>-<训练模式>`,如 `base-10000-tf`(tf=teacher-forcing flow;
+  若 scheduled-sampling 则 `ss`)。当前 ckpt = `base-10000-tf`
+  (`checkpoints/code2world_base_spec_ddp/ckpt_final.pt`)。
+- **推理模式**:`ar`(block-autoregressive,`block_ar_generate`)。
+- **block 大小**:`block_size=3`(每次联合去噪 3 个 latent)。
+- **每 block 步数**:`flow_steps=16`(Euler 积分步数)。
+- **固定 seed**:生成脚本用 `--seed`(torch.manual_seed),多变体对比时**每个变体重置同一 seed**,
+  保证变体间差异纯来自 code condition、不含噪声差异。默认 `--seed 0`。
+- **场景/动作**:level(单场景哪张)、eval episode index(`--ep`)、动作流来源。
+- **窗口**:`window=20`(21 latent = init + 20 target),`num_actions=6`(compact),`action_compact`。
+
+命名示例(目录 + README 头):
+```
+examples/sens_base-10000-tf_lv30_ep462_ar_bs3_fs16_seed0/
+  compare_3x2.mp4   # 主产物
+  README.txt        # 权重 base-10000-tf / 模式 ar / block_size 3 / flow_steps 16 /
+                    #   seed 0 / level 30 / ep 462 / configs=[...] / 各变体 mean|Δ|
+```
+
+**③ 复现脚本**:`rollout_sample.py`(单变体 GT-vs-gen video)、`code_sensitivity_test.py`
+(多变体 code-sensitivity,base 单独 + 3×2 网格),都支持 `--seed`。见 `docs/eval_artifacts.md`。

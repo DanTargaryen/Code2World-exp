@@ -58,6 +58,7 @@ def main():
                     help="output dir; writes video.mp4 + grid.png")
     ap.add_argument("--fps", type=int, default=8)
     ap.add_argument("--scale", type=int, default=6, help="video upscale factor")
+    ap.add_argument("--seed", type=int, default=0, help="fixed seed for flow sampling noise")
     ap.add_argument("--device", default="cuda:0")
     args = ap.parse_args()
     dev = args.device
@@ -100,6 +101,7 @@ def main():
     acts = remap_to_compact(torch.as_tensor(raw_actions)).numpy() if compact else raw_actions
     code = eval_ds.code_embeds[args.variant].float().unsqueeze(0).to(dev)   # (1, N, Dc)
     init = lat[:1].unsqueeze(0)                                # (1,1,z,h,w)
+    torch.manual_seed(args.seed)                              # reproducible flow sampling
     gen = block_ar_generate(model, init, acts, code, num_actions, dev,
                             block_size, args.flow_steps)[0]    # (K, z, h, w)
 
