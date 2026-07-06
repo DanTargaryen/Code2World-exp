@@ -37,6 +37,13 @@ MECHANICS = {
 
 VANILLA = {m: spec[3] for m, spec in MECHANICS.items()}
 
+# procgen TOP-LEVEL env options (NOT coinrun_* mechanics): these are passed as
+# ProcgenEnv(<key>=...) kwargs, not through coinrun_config. Path in spec -> (kwarg, default).
+# Used for global-visual variants (e.g. background on/off) that procgen exposes natively.
+ENV_OPTS = {
+    "use_backgrounds": (("appearance", "use_backgrounds"), True),
+}
+
 
 class ConfigError(ValueError):
     pass
@@ -99,11 +106,20 @@ def load_config(path):
         if val != default:
             coinrun_config[opt] = val
 
+    # procgen top-level env options (only forwarded when they differ from default)
+    env_opts = {}
+    for key, (epath, edefault) in ENV_OPTS.items():
+        v = _get_path(spec, epath)
+        if v is not None and bool(v) != edefault:
+            env_opts[key] = bool(v)
+            overrides.add(key)
+
     name = spec.get("name") or os.path.splitext(os.path.basename(path))[0]
     return {
         "name": name,
         "spec": spec,
         "coinrun_config": coinrun_config,
+        "env_opts": env_opts,
         "mechanics": mechanics,
         "overrides": overrides,
         "raw": raw,

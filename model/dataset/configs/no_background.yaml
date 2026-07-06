@@ -1,0 +1,133 @@
+# =============================================================================
+# CoinRun [no_background variant] — sky background removed (black backdrop)
+# Full spec (readable rewrite of coinrun.cpp); [CHANGED] marks this variant's edit.
+#
+# This YAML *is* the game: it describes CoinRun's complete logic — world, player
+# physics, procedural level generation, entities, collision rules, win/lose
+# conditions — in a declarative form. Reading this file == reading the source.
+# It is what the text encoder reads as the code condition.
+#
+# Faithful to procgen/src/games/coinrun.cpp. Numbers in [brackets] cite the
+# mechanic; `randn(n)` = uniform random integer in 0..n-1 (procgen RandGen).
+# =============================================================================
+
+name: coinrun
+genre: 2D side-scrolling platformer
+objective: >
+  Run and jump rightward across procedurally generated terrain, avoid hazards,
+  and reach the goal coin at the far right. Reaching it completes the level.
+
+world:
+  grid: 64 x 64 tiles           # main_width x main_height
+  view: camera follows the player horizontally
+  gravity_direction: down
+  border: solid wall on all four edges   # init_floor_and_walls()
+  player_start: bottom-left corner, standing on the floor (x=1.5, y≈1.58)
+
+# --- how the player moves (update_agent_velocity) --------------------------
+player:
+  size: 1 wide x ~1.16 tall (rx=0.5, ry=0.5787)
+  actions: [left, right, jump, up-left, up-right, stay]   # horizontal + jump combos
+  physics:
+    horizontal:
+      # velocity eases toward (max_speed * input) at rate `mixrate`; grounded uses
+      # full mixrate, airborne uses mixrate * air_control (less control in the air).
+      max_speed: 0.5
+      mixrate: 0.2
+      air_control: 0.15
+      snap_to_zero_below: mixrate * max_speed   # tiny speeds clamp to 0
+    vertical:
+      # jump only fires when the player has ground support; sets vy = max_jump.
+      # otherwise gravity pulls down each step, vy clamped to +/- max_jump.
+      gravity: 0.2
+      max_jump: 1.5
+      jump_requires_support: true
+    support:
+      # "has_support" = standing on a wall tile / out-of-bounds floor / a crate,
+      # AND vy == 0. Only then can the player jump.
+      sources: [wall_tile, crate, world_floor]
+
+# --- procedural level layout (generate_coin_to_the_right) ------------------
+# The level is built left-to-right as a chain of ground "sections" of varying
+# height, with hazards sprinkled in. Difficulty `dif` scales section count,
+# hazard density and jump gaps.
+level_generation:
+  difficulty:
+    dif: randn(3) + 1            # 1..3; drives everything below
+    num_sections: randn(dif) + dif
+  # which hazard/obstacle kinds level generation may place (false = never spawn):
+  enabled_hazards:
+    pit:      true               # dangerous gaps with lava/saws/monsters at the bottom
+    crate:    true               # stackable crate obstacles on platforms
+    monster:  true               # moving monsters on platforms
+  reachability:
+    # max jump distance the physics actually allow (keeps levels solvable):
+    max_dy: floor(max_jump^2 / (2*gravity) - 0.5)
+    max_dx: floor(max_speed * 2 * max_jump / gravity - 0.5)
+  section_loop:                  # repeated num_sections times, advancing curr_x
+    stop_when: curr_x + 15 >= grid_width
+    height_change dy:
+      base: randn(4) + 1 + dif//3
+      clamp: dy <= max_dy
+      # terrain tends to descend once high, to stay in bounds:
+      flip_down_if: curr_y >= 20, or (curr_y >= 5 and coin-flip)
+      disabled_by: allow_dy=false  ->  flat terrain (dy=0)
+    section_width dx: randn(2*dif) + 3 + dif//3
+    place: raise/lower ground to curr_y over width dx
+    pit_or_platform:
+      # a section is either a dangerous PIT (gap with a hazard at the bottom) or a
+      # solid platform that may carry surface hazards + crates.
+      pit:
+        when: allow_pit and dx > 7 and curr_y > 3 and randn(20) >= dif
+        shape: solid ground on both sides, a gap of `pit_width` in the middle
+        hazard_at_bottom (danger_type = randn(3), fixed per level):
+          - 0: lava pool filling the pit bottom
+          - 1: a row of buzzsaws
+          - 2: a row of walking monsters
+        stepping_stone: if pit_width > 4, add a small floating ground block to cross
+      platform:
+        surface_hazards:
+          saw:     when randn(10) < 2*dif and dx > 3         # spawns a buzzsaw
+          monster: when randn(10) < dif and dx > 3 and allow_monsters
+          crate:   up to 2 crate stacks (height randn(3)+1) at randn positions
+    enemy_barrier: invisible walls at section edges so monsters can't wander off
+  goal:
+    placement: a gold coin on top of the final section's ground, at the far right
+    beyond_goal: the rest of the map is filled solid so the goal is the end
+
+# --- the objects that populate the world -----------------------------------
+entities:
+  player:  { role: agent, controlled_by: actions }
+  goal:    { sprite: gold coin, effect: reach it to win }
+  wall:    { solid: true, supports_player: true, blocks: [player, monster] }
+  lava:    { hazard: true, lethal_to: player }
+  saw:     { hazard: true, static: true, lethal_to: player }
+  monster: { hazard: true, moves: horizontally, bounces off walls/barriers, lethal_to: player }
+  crate:   { pushable: false, one_way_platform: true }   # land on top from above only
+
+# --- what collisions do (handle_*_collision, is_blocked*) ------------------
+collision_rules:
+  player_vs_wall:    blocked, cannot pass through solid ground or border
+  player_vs_crate:   one-way platform, land on top when falling but pass through from sides/below
+  player_vs_goal:    win — grant reward, mark level complete, end episode
+  monster_vs_wall:   monster reflects, reverses horizontal direction
+  # which hazards are lethal on contact (true = touching ends the episode):
+  lethal:
+    lava:    true
+    saw:     true
+    monster: true
+
+# --- win / lose (termination) ----------------------------------------------
+termination:
+  win:  reach the goal coin        # grants goal_reward, marks level_complete
+  lose: touch a lethal hazard (see collision_rules.lethal)
+  reward:
+    goal_reward: 10.0              # granted once, on reaching the goal
+    otherwise: 0                   # no shaping reward, sparse
+
+# --- rendering (visual theme; does not affect dynamics) --------------------
+appearance:
+  use_backgrounds: false        # [CHANGED from true] no sky background -> black backdrop
+  player: alien sprite (one of 5 color themes), walk/jump animation frames
+  ground: tiled themed blocks (Dirt/Grass/Planet/Sand/Snow/Stone)
+  note: background disabled; the sky/parallax backdrop is removed, gameplay unchanged

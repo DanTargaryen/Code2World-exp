@@ -35,11 +35,12 @@ def make_action_stream(seed, n):
     return acts[:n]
 
 
-def rollout(level, cfg, actions):
+def rollout(level, cfg, actions, env_opts=None):
     """Run the fixed action stream on `level`; stop at done (episode end). Returns
     list of (64,64,3) frames and whether it ended by death/goal."""
     venv = ProcgenEnv(num_envs=1, env_name="coinrun", num_levels=1,
-                      start_level=level, distribution_mode="hard", coinrun_config=cfg)
+                      start_level=level, distribution_mode="hard",
+                      coinrun_config=cfg, **(env_opts or {}))
     frames = [venv.reset()["rgb"][0].copy()]
     ended = False
     for a in actions:
@@ -87,8 +88,9 @@ def main():
     actions = make_action_stream(args.astream_seed, args.max_frames)
     seqs = {}
     for v in args.variants:
-        cfg = load_config(os.path.join(HERE, "dataset", "configs", f"{v}.yaml"))["coinrun_config"] or None
-        fr, ended = rollout(args.level, cfg, actions)
+        c = load_config(os.path.join(HERE, "dataset", "configs", f"{v}.yaml"))
+        fr, ended = rollout(args.level, c["coinrun_config"] or None, actions,
+                            env_opts=c["env_opts"] or None)
         seqs[v] = (fr, ended)
         print(f"  {v:12s}: {len(fr):3d} frames{' (ended: death/goal)' if ended else ' (survived max)'}", flush=True)
         write_video(os.path.join(args.out, f"{v}.mp4"),
